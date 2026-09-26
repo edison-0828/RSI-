@@ -1,0 +1,40 @@
+﻿{
+    "exec_mode":  "okx_demo",
+    "exec_mode_text":  "OKX 模拟盘",
+    "keysConfigured":  true,
+    "account":  {
+                    "keysConfigured":  true,
+                    "posMode":  "net_mode",
+                    "posModeText":  "买卖模式（单向持仓）",
+                    "acctLv":  "2",
+                    "acctLvText":  "合约模式",
+                    "usdtEq":  66577.26639631319,
+                    "usdtAvail":  66577.26639631319,
+                    "totalEq":  66555.2959694349,
+                    "updatedAt":  "2026-09-25T02:30:53.377Z",
+                    "error":  null
+                },
+    "posMode":  "net_mode",
+    "risk":  {
+                 "exec_mode":  "okx_demo",
+                 "today_realized_usdt":  -59.62999673000425,
+                 "daily_loss_limit_usdt":  500,
+                 "daily_loss_hit":  false,
+                 "orders_last_hour":  2,
+                 "max_orders_per_hour":  10,
+                 "max_spread_pct":  0.3,
+                 "kill_switch":  {
+                                     "on":  false,
+                                     "at":  null,
+                                     "reason":  null
+                                 },
+                 "pending_opens":  [
+
+                                   ]
+             },
+    "reconcile":  {
+                      "lastAt":  "2026-09-25T02:30:54.761Z",
+                      "error":  null
+                  },
+    "liveAutoTradeDisabled":  true
+}

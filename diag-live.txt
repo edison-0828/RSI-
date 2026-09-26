@@ -1,0 +1,79 @@
+﻿{
+    "ok":  false,
+    "reasons":  [
+                    "当前持仓模式为「开平仓模式（双向持仓）」：请在 OKX → 交易设置 → 持仓模式 改为「买卖模式（单向持仓）」（需先平掉所有永续仓位和挂单）",
+                    "实盘可用 USDT 0.00 \u003c 每笔保证金 20 USDT"
+                ],
+    "checks":  [
+                   {
+                       "key":  "keys",
+                       "label":  "实盘 API Key 已配置",
+                       "ok":  true,
+                       "detail":  "已配置（不显示内容）"
+                   },
+                   {
+                       "key":  "perm",
+                       "label":  "Key 无提现权限",
+                       "ok":  true,
+                       "detail":  "权限：read_only / trade"
+                   },
+                   {
+                       "key":  "trade",
+                       "label":  "Key 有交易权限",
+                       "ok":  true,
+                       "detail":  "有交易权限"
+                   },
+                   {
+                       "key":  "acctLv",
+                       "label":  "账户模式支持全仓永续",
+                       "ok":  true,
+                       "detail":  "合约模式"
+                   },
+                   {
+                       "key":  "posMode",
+                       "label":  "持仓模式为买卖模式（net_mode）",
+                       "ok":  false,
+                       "detail":  "当前持仓模式为「开平仓模式（双向持仓）」：请在 OKX → 交易设置 → 持仓模式 改为「买卖模式（单向持仓）」（需先平掉所有永续仓位和挂单）"
+                   },
+                   {
+                       "key":  "balance",
+                       "label":  "可用 USDT 够一笔保证金",
+                       "ok":  false,
+                       "detail":  "实盘可用 USDT 0.00 \u003c 每笔保证金 20 USDT"
+                   },
+                   {
+                       "key":  "ip",
+                       "label":  "（建议）Key 已绑定 IP",
+                       "ok":  true,
+                       "detail":  "提示：该 Key 未绑定 IP，建议在 OKX 为 Key 绑定本机公网 IP"
+                   }
+               ],
+    "account":  {
+                    "keysConfigured":  true,
+                    "posMode":  "long_short_mode",
+                    "posModeText":  "开平仓模式（双向持仓）",
+                    "acctLv":  "2",
+                    "acctLvText":  "合约模式",
+                    "perm":  "read_only,trade",
+                    "ipBound":  false,
+                    "exec_mode":  "okx_live",
+                    "envText":  "实盘",
+                    "usdtEq":  6.930744E-10,
+                    "usdtAvail":  6.930744E-10,
+                    "totalEq":  0.003178461159508,
+                    "updatedAt":  "2026-09-25T07:08:18.030Z",
+                    "error":  null
+                },
+    "summary":  {
+                    "amount":  20,
+                    "leverage":  5,
+                    "notional":  100,
+                    "max_positions":  3,
+                    "daily_loss_limit_usdt":  30,
+                    "max_orders_per_hour":  5,
+                    "take_profit_pct":  8,
+                    "stop_loss_pct":  6
+                },
+    "maxLeverage":  20,
+    "confirmText":  "确认实盘"
+}
