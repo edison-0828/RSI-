@@ -83,12 +83,27 @@ function resolveOkxCmd() {
     if (p && existsSync(p)) return { cmd: p, argsPrefix: [], shell: false };
   }
   const nodeDir = dirname(process.execPath);
-  const npxLocal = isWin ? join(nodeDir, 'npx.cmd') : join(nodeDir, 'npx');
-  const npxCmd = existsSync(npxLocal) ? npxLocal : (isWin ? 'npx.cmd' : 'npx');
+  if (isWin) {
+    // cmd.exe 会把带空格的 npx.cmd 路径截断（例如 C:\Program Files -> C:\Program）。
+    // 直接让 node 运行 npm 自带的 JS 入口，参数无需经过 shell 拼接。
+    const npxJsCandidates = [
+      join(nodeDir, 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+      process.env.npm_execpath ? join(dirname(process.env.npm_execpath), 'npx-cli.js') : '',
+    ];
+    const npxJs = npxJsCandidates.find((p) => p && existsSync(p));
+    if (!npxJs) throw new Error('找不到 npm 的 npx-cli.js，请检查 Node.js/npm 安装');
+    return {
+      cmd: process.execPath,
+      argsPrefix: [npxJs, '--yes', '@okx_ai/okx-trade-cli@latest'],
+      shell: false,
+    };
+  }
+  const npxLocal = join(nodeDir, 'npx');
+  const npxCmd = existsSync(npxLocal) ? npxLocal : 'npx';
   return {
     cmd: npxCmd,
     argsPrefix: ['--yes', '@okx_ai/okx-trade-cli@latest'],
-    shell: isWin,
+    shell: false,
   };
 }
 

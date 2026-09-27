@@ -4,6 +4,7 @@
  * - 自动重连 + ping
  */
 import WebSocket from 'ws';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 export const WS_PUBLIC = 'wss://ws.okx.com:8443/ws/v5/public';
 export const WS_BUSINESS = 'wss://ws.okx.com:8443/ws/v5/business';
@@ -67,7 +68,9 @@ class OkxWsConn {
     if (this.closed) return;
     this.cleanupSocket();
     this.log('info', `[${this.label}] 连接 ${this.url} args=${this.args.length}`);
-    const ws = new WebSocket(this.url);
+    // ws 不会自动读取 Node fetch 的代理设置；行情连接需要显式使用代理。
+    const proxyUrl = process.env.WSS_PROXY || process.env.wss_proxy || process.env.HTTPS_PROXY || process.env.https_proxy;
+    const ws = new WebSocket(this.url, proxyUrl ? { agent: new HttpsProxyAgent(proxyUrl) } : {});
     this.ws = ws;
 
     ws.on('open', () => {
