@@ -11,8 +11,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { calcRsi } from './rsi.js';
 import { CandleStore } from './candleStore.js';
-import { recordClose, clearTrades, buildPnLDashboard, todayRealized, usedCloseKeys, listTrades } from './pnl.js';
-import { CoinGuard, clampGuardCfg, GUARD_DEFAULTS } from './coinGuard.js';
+import { recordClose, clearTrades, buildPnLDashboard, todayRealized } from './pnl.js';
 import { OkxWsManager, barToCandleChannel } from './okxWs.js';
 import { loadEnvLocal } from './env.js';
 import { OkxExecutor, demoKeysConfigured, liveKeysConfigured, keysConfiguredFor, reasonText, LIVE_MAX_LEVERAGE } from './executor.js';
@@ -40,8 +39,6 @@ const STATE_PATH = join(DATA_DIR, 'positions.json');
 const LIVE_DIR = join(DATA_DIR, 'live');
 const LIVE_STATE_PATH = join(LIVE_DIR, 'positions.json');
 const EVENTS_LOG_PATH = join(DATA_DIR, 'events.log');
-/** 同币冷却 / 止损过滤状态（重启后恢复） */
-const COOLDOWN_PATH = join(DATA_DIR, 'cooldowns.json');
 const EVENTS_LOG_MAX_BYTES = 20 * 1024 * 1024;
 const PERSIST_LEVELS = new Set(['warn', 'error', 'buy', 'sell', 'tp', 'sl']);
 const RECONCILE_MS = 20000;
@@ -227,14 +224,8 @@ const DEFAULT_SCAN = {
   universeLimit: 120,
   scanConcurrency: 6,
   refreshSec: 60,
-  // 同币冷却：滚动窗口（sl_filter_hours 小时）内止损达 max_consecutive_sl 次 → 暂停 sl_filter_hours 小时（止盈不清零）
-  max_consecutive_sl: GUARD_DEFAULTS.max_consecutive_sl,
-  sl_filter_hours: GUARD_DEFAULTS.sl_filter_hours,
-  // 普通止损后该币冷却（分钟）
-  sl_cooldown_minutes: GUARD_DEFAULTS.sl_cooldown_minutes,
-  // 严重止损阈值（价格变动 %，不含杠杆）与冷却（小时）
-  severe_sl_pct: GUARD_DEFAULTS.severe_sl_pct,
-  severe_sl_cooldown_hours: GUARD_DEFAULTS.severe_sl_cooldown_hours,
+  max_consecutive_sl: 2,
+  sl_filter_hours: 24,
   watchlist: [],
 };
 
@@ -289,7 +280,8 @@ function clampConfig(body = {}) {
   cfg.scanConcurrency = Math.max(1, Math.min(12, Number(cfg.scanConcurrency) || 6));
   // 信号评估间隔：WS 推送行情后，前端/后端评估节奏（可短）
   cfg.refreshSec = Math.max(2, Number(cfg.refreshSec) || Number(cfg.poll_interval_sec) || 60);
-  Object.assign(cfg, clampGuardCfg(cfg)); // max_consecutive_sl / sl_filter_hours / sl_cooldown_minutes / severe_sl_pct / severe_sl_cooldown_hours
+  cfg.max_consecutive_sl = Math.max(1, Math.min(20, Number(cfg.max_consecutive_sl) || 2));
+  cfg.sl_filter_hours = Math.max(0, Math.min(24 * 30, Number(cfg.sl_filter_hours) ?? 24));
   cfg.exec_mode = normExecMode(cfg.exec_mode);
   // profile 跟随执行方式：实盘=live，模拟盘=demo（本地模拟保留原值，永不下单）
   if (cfg.exec_mode === 'okx_live') cfg.profile = 'live';
@@ -313,8 +305,8 @@ function clampConfig(body = {}) {
 // ---------- Scan state ----------
 /** @type {Map<string, object>} */
 const positions = new Map();
-/** 同币冷却（普通止损 / 严重止损 / 窗口内多次止损），按执行模式分开，落盘 data/cooldowns.json */
-const coinGuard = new CoinGuard({ path: COOLDOWN_PATH, log: (level, msg) => pushLog(level, msg) });
+/** 连续止损计数与过滤：instId -> { streak, filteredUntil, reason, updatedAt } */
+const slGuard = new Map();
 /** @type {Array<object>} */
 let lastSignals = [];
 /** @type {Array<object>} */
@@ -492,26 +484,6 @@ function loadState() {
   }
 }
 
-/** 恢复同币冷却；首次启用（无 cooldowns.json）时按账本近期止损补建 */
-function loadCoinGuard() {
-  try {
-    if (existsSync(COOLDOWN_PATH)) {
-      const n = coinGuard.load(DEFAULT_SCAN);
-      if (n > 0) pushLog('info', `已恢复同币冷却 ${n} 个（重启不影响冷却计时）`);
-    } else {
-      const trades = [];
-      for (const m of EXEC_MODES) trades.push(...listTrades(200, m));
-      const n = coinGuard.seedFromTrades(trades, DEFAULT_SCAN);
-      pushLog('info', `首次启用同币冷却：已按账本近期止损补建 ${n} 个冷却`);
-    }
-    for (const it of coinGuard.list(DEFAULT_SCAN)) {
-      pushLog('info', `[冷却] ${execModeText(it.exec_mode)} ${it.instId} ${it.kindText}，${it.remainingText}`);
-    }
-  } catch (e) {
-    pushLog('warn', `恢复同币冷却失败：${e.message}`);
-  }
-}
-
 function modePositions(mode) {
   return [...positions.values()].filter((p) => (p.exec_mode || 'sim') === mode);
 }
@@ -587,7 +559,7 @@ function publicScan() {
       note: null,
       feed: feedMode,
       ws: wsPublicStatus(),
-      filteredCount: listFilteredCoins(DEFAULT_SCAN).length,
+      filteredCount: 0,
       exec_mode: 'sim',
       killSwitch: riskState.killSwitch.on,
     };
@@ -969,27 +941,67 @@ async function fetchInstMetricsLocal(instId, cfg) {
 
 
 function listFilteredCoins(cfg) {
-  return coinGuard.list(cfg || effectiveCfg());
+  const now = Date.now();
+  const out = [];
+  for (const [instId, g] of slGuard.entries()) {
+    if (g.filteredUntil && g.filteredUntil > now) {
+      out.push({
+        instId,
+        streak: g.streak || 0,
+        filteredUntil: new Date(g.filteredUntil).toISOString(),
+        remainingMs: g.filteredUntil - now,
+        reason: g.reason || '连续止损',
+        updatedAt: g.updatedAt || null,
+      });
+    } else if (g.filteredUntil && g.filteredUntil <= now) {
+      // 冷却结束：清过滤，保留 streak=0
+      slGuard.set(instId, { streak: 0, filteredUntil: 0, reason: null, updatedAt: new Date().toISOString() });
+    }
+  }
+  out.sort((a, b) => a.instId.localeCompare(b.instId));
+  return out;
 }
 
-/** 该币在指定执行模式下的冷却状态：null 或 { kind, until, remainingMs, reason, text } */
-function coinCooldown(instId, mode = effectiveCfg().exec_mode) {
-  return coinGuard.check(normExecMode(mode), instId);
+function isCoinFiltered(instId) {
+  const g = slGuard.get(instId);
+  if (!g || !g.filteredUntil) return false;
+  if (g.filteredUntil > Date.now()) return true;
+  slGuard.set(instId, { streak: 0, filteredUntil: 0, reason: null, updatedAt: new Date().toISOString() });
+  return false;
 }
 
-function onTakeProfit(instId, mode) {
-  // 止盈不再清零窗口内止损次数
-  coinGuard.onTakeProfit(normExecMode(mode), instId);
+function onTakeProfit(instId) {
+  const g = slGuard.get(instId) || { streak: 0, filteredUntil: 0 };
+  slGuard.set(instId, {
+    streak: 0,
+    filteredUntil: g.filteredUntil && g.filteredUntil > Date.now() ? g.filteredUntil : 0,
+    reason: null,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
-/**
- * 止损 / 强平后进入冷却
- * @param {object} pos 平仓的持仓
- * @param {object} cfg
- * @param {{ pct?: number, at?: number, action?: string }} info pct=价格变动%（不含杠杆）
- */
-function onStopLoss(pos, cfg, { pct = null, at = null, action = 'sl' } = {}) {
-  return coinGuard.onStopLoss(normExecMode(pos.exec_mode), pos.instId, cfg, { lossPct: pct, at, liq: action === 'liq' });
+function onStopLoss(instId, cfg) {
+  const maxSl = Number(cfg.max_consecutive_sl) || 2;
+  const hours = Number(cfg.sl_filter_hours);
+  const prev = slGuard.get(instId) || { streak: 0, filteredUntil: 0 };
+  const streak = (prev.streak || 0) + 1;
+  let filteredUntil = prev.filteredUntil || 0;
+  let reason = null;
+  if (streak >= maxSl) {
+    const ms = (Number.isFinite(hours) ? hours : 24) * 3600 * 1000;
+    filteredUntil = ms <= 0 ? Date.now() + 365 * 24 * 3600 * 1000 : Date.now() + ms;
+    reason = `连续止损 ${streak} 次（阈值 ${maxSl}）`;
+    const untilTxt = ms <= 0 ? '长期（需手动解除）' : new Date(filteredUntil).toLocaleString('zh-CN', { hour12: false });
+    pushLog('warn', `[过滤] ${instId} ${reason}，暂停开仓至 ${untilTxt}`);
+  } else {
+    pushLog('info', `${instId} 连续止损计数 ${streak}/${maxSl}`);
+  }
+  slGuard.set(instId, {
+    streak,
+    filteredUntil,
+    reason,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 /** 服务端风控：返回拒绝原因（中文），null 表示放行。perInst=true 表示只针对该币（进入跳过冷却） */
@@ -1040,14 +1052,13 @@ function tryOpenPosition(signalRow, cfg) {
     return { status: 'skip', reason: `已有${execModeText(held.exec_mode)}持仓，不叠加开仓` };
   }
   if (pendingOpens.has(instId)) return { status: 'submitting' };
-  const cd = coinCooldown(instId, execMode);
-  if (cd) return { status: 'skip', reason: cd.text, until: cd.until, cooldown: true, coinCooldown: cd.kind };
   const skip = activeSkip(instId);
   if (skip) return { status: 'skip', reason: skip.reason, cooldown: true };
   const count = modePositions(execMode).length;
   if (count + pendingOpens.size >= cfg.max_positions) {
     return { status: 'skip', reason: `持仓已满（${count}/${cfg.max_positions}）`, full: true };
   }
+  if (isCoinFiltered(instId)) return { status: 'skip', reason: '连续止损过滤中' };
   if (signalRow.price == null || !Number.isFinite(signalRow.price)) return { status: 'skip', reason: '暂无有效价格' };
   if (execMode === 'okx_demo' && !demoHasInst(instId)) {
     return { status: 'skip', reason: '模拟盘无此合约' };
@@ -1176,7 +1187,7 @@ function checkExit(pos, price, cfg) {
     );
     positions.delete(pos.instId);
     saveState();
-    onTakeProfit(pos.instId, pos.exec_mode);
+    onTakeProfit(pos.instId);
     return { action: 'tp', profitPct, pnl_usdt: trade.pnl_usdt };
   }
   if (profitPct <= -cfg.stop_loss_pct) {
@@ -1187,7 +1198,7 @@ function checkExit(pos, price, cfg) {
     );
     positions.delete(pos.instId);
     saveState();
-    onStopLoss(pos, cfg, { pct: profitPct, action: 'sl' });
+    onStopLoss(pos.instId, cfg);
     return { action: 'sl', profitPct, pnl_usdt: trade.pnl_usdt };
   }
   return null;
@@ -1257,16 +1268,15 @@ function evaluateSignals({ quiet = false } = {}) {
     const rsiClosed = snap.rsi;
     const rsiShow = snap.forming && snap.rsiForming != null ? snap.rsiForming : rsiClosed;
     const rsiValid = isValidRsi(rsiShow);
-    const cd = coinCooldown(instId, execMode);
-    const filtered = !!cd;
+    const filtered = isCoinFiltered(instId);
     // okx_demo：模拟盘不存在的合约（自选/持仓里的）永不触发
     const notOnDemo = execMode === 'okx_demo' && cfg.mode === 'swap' && !demoHasInst(instId);
     const sig = buySignalFromRsi(rsiShow, rsiClosed, cfg);
-    // 冷却中的币仍标记为触发，由开仓环节跳过并显示「冷却中：…，剩余xx分钟」
-    const signal = sig.signal && !notOnDemo;
+    const signal = sig.signal && !filtered && !notOnDemo;
     const price = snap.price ?? uni?.price ?? null;
     let signalText;
     if (notOnDemo) signalText = '模拟盘无此合约';
+    else if (filtered) signalText = `连续止损已过滤（至 ${new Date(slGuard.get(instId).filteredUntil).toLocaleString('zh-CN', { hour12: false })}）`;
     else if (!rsiValid) signalText = 'RSI 无效（K 线不足或无数据）';
     else if (signal) {
       signalText = cfg.confirm_on_close
@@ -1276,7 +1286,6 @@ function evaluateSignals({ quiet = false } = {}) {
           : 'RSI 进入超卖区，触发买入！';
     } else if (sig.waitingClose) signalText = '实时 RSI 低于阈值，等待收盘确认';
     else signalText = '未触发';
-    if (cd && !signal) signalText = `${signalText}（${cd.text}）`;
     rows.push({
       instId,
       volUsd24h: uni?.volUsd24h ?? 0,
@@ -1285,7 +1294,6 @@ function evaluateSignals({ quiet = false } = {}) {
       rsiClosed,
       forming: !!snap.forming,
       filtered,
-      cooldown: cd ? { kind: cd.kind, until: new Date(cd.until).toISOString(), text: cd.text, reason: cd.reason } : null,
       notOnDemo,
       signal,
       signalText,
@@ -1347,7 +1355,7 @@ function evaluateSignals({ quiet = false } = {}) {
       s.skipped = true;
       s.skipReason = res.reason || '未知原因';
       const sk = activeSkip(s.instId);
-      s.skipUntil = res.until ? new Date(res.until).toISOString() : sk ? new Date(sk.until).toISOString() : null;
+      s.skipUntil = sk ? new Date(sk.until).toISOString() : null;
       s.signalText = `触发但未下单：${s.skipReason}`;
       if (res.full && !fullLogged && !quiet) {
         fullLogged = true;
@@ -1591,7 +1599,6 @@ function finalizeExchangeClose(pos, res, { estimated = false } = {}) {
     inferred: !!res.inferred,
     estimated,
     closed_at: res.uTime ? new Date(res.uTime).toISOString() : undefined,
-    close_key: estimated ? null : res.close_key || null,
   });
   positions.delete(pos.instId);
   saveState();
@@ -1602,8 +1609,8 @@ function finalizeExchangeClose(pos, res, { estimated = false } = {}) {
       estimated ? '（估算：未查到平仓记录）' : `（含手续费 ${fmtNum(res.fee, 4)}${res.fundingFee ? ` · 资金费 ${fmtNum(res.fundingFee, 4)}` : ''}）`
     }${res.inferred ? ' · 类型按价格推断' : ''}`
   );
-  if (res.action === 'tp') onTakeProfit(pos.instId, pos.exec_mode);
-  else if (res.action === 'sl' || res.action === 'liq') onStopLoss(pos, cfg, { pct, at: res.uTime || null, action: res.action });
+  if (res.action === 'tp') onTakeProfit(pos.instId);
+  else if (res.action === 'sl' || res.action === 'liq') onStopLoss(pos.instId, cfg);
   return trade;
 }
 
@@ -1750,7 +1757,7 @@ async function reconcileExchange(mode) {
         pos.status = 'closing';
         let res = null;
         try {
-          res = await ex.resolveClose(pos, usedCloseKeys(mode));
+          res = await ex.resolveClose(pos);
         } catch (e) {
           logThrottled(`resolve-${pos.instId}`, 'warn', `${ex.tag} 查询 ${pos.instId} 平仓记录失败：${e.message}`, 60000);
         }
@@ -2047,9 +2054,6 @@ app.get('/api/scan/status', (req, res) => {
     view_exec_mode: viewMode,
     externalPositions: isExchangeMode(viewMode) ? externalByMode[viewMode] : [],
     filtered: listFilteredCoins(scanState?.config || DEFAULT_SCAN),
-    // 参数默认值（未启动扫描时 scan.config 为空，界面/校验可用这里的默认值）
-    config_defaults: clampConfig({}),
-    config_defaults_live: clampConfig({ exec_mode: 'okx_live' }),
     signals: lastSignals.slice(0, 100),
     positions: posList,
     pnl: buildPnLDashboard(posList, viewMode),
@@ -2085,22 +2089,18 @@ app.get('/api/filtered', (_req, res) => {
     count: list.length,
     max_consecutive_sl: cfg.max_consecutive_sl,
     sl_filter_hours: cfg.sl_filter_hours,
-    sl_cooldown_minutes: cfg.sl_cooldown_minutes ?? GUARD_DEFAULTS.sl_cooldown_minutes,
-    severe_sl_pct: cfg.severe_sl_pct ?? GUARD_DEFAULTS.severe_sl_pct,
-    severe_sl_cooldown_hours: cfg.severe_sl_cooldown_hours ?? GUARD_DEFAULTS.severe_sl_cooldown_hours,
     items: list,
   });
 });
 
 app.post('/api/filtered/clear', (req, res) => {
   const instId = req.body?.instId ? String(req.body.instId).toUpperCase() : null;
-  const mode = req.body?.exec_mode ? normExecMode(req.body.exec_mode) : null;
   if (instId) {
-    coinGuard.clear(instId, mode);
-    pushLog('info', `已手动解除冷却/过滤：${instId}${mode ? `（${execModeText(mode)}）` : ''}`);
+    slGuard.delete(instId);
+    pushLog('info', `已手动解除过滤：${instId}`);
   } else {
-    coinGuard.clear(null, mode);
-    pushLog('info', `已清空全部同币冷却/止损过滤${mode ? `（${execModeText(mode)}）` : ''}`);
+    slGuard.clear();
+    pushLog('info', '已清空全部连续止损过滤');
   }
   res.json({ ok: true, items: listFilteredCoins(scanState?.config || DEFAULT_SCAN) });
 });
@@ -2478,7 +2478,6 @@ process.on('unhandledRejection', (e) => {
 });
 
 loadState();
-loadCoinGuard();
 
 app.listen(PORT, '127.0.0.1', () => {
   pushLog('info', `RSI抄底宝扫描后端已启动 :${PORT} · 行情源 WebSocket`);

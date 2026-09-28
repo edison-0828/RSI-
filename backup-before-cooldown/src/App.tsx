@@ -21,9 +21,6 @@ interface FormState {
   scanConcurrency: string;
   max_consecutive_sl: string;
   sl_filter_hours: string;
-  sl_cooldown_minutes: string;
-  severe_sl_pct: string;
-  severe_sl_cooldown_hours: string;
   leverage: string;
   watchlist: string;
   exec_mode: ExecMode;
@@ -47,25 +44,11 @@ interface SignalRow {
   watchlist?: boolean;
   forming?: boolean;
   filtered?: boolean;
-  cooldown?: { kind: string; until: string; text: string; reason?: string } | null;
   notOnDemo?: boolean;
   skipped?: boolean;
   skipReason?: string | null;
   skipUntil?: string | null;
   submitting?: boolean;
-}
-
-/** 同币冷却 / 止损过滤条目（后端 coinGuard.list） */
-interface FilteredItem {
-  instId: string;
-  exec_mode?: ExecMode;
-  kind?: 'normal' | 'severe' | 'streak';
-  kindText?: string;
-  streak: number;
-  filteredUntil: string;
-  remainingMs?: number;
-  remainingText?: string;
-  reason?: string;
 }
 
 interface PositionRow {
@@ -270,9 +253,6 @@ const DEFAULTS: FormState = {
   scanConcurrency: '6',
   max_consecutive_sl: '2',
   sl_filter_hours: '24',
-  sl_cooldown_minutes: '60',
-  severe_sl_pct: '3',
-  severe_sl_cooldown_hours: '24',
   leverage: '1',
   watchlist: '',
   exec_mode: 'sim',
@@ -390,7 +370,7 @@ export default function App() {
   const [signals, setSignals] = useState<SignalRow[]>([]);
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [filtered, setFiltered] = useState<
-    FilteredItem[]
+    { instId: string; streak: number; filteredUntil: string; reason?: string }[]
   >([]);
   const [pnl, setPnl] = useState<PnLDashboard | null>(null);
   const [logs, setLogs] = useState<LogItem[]>([]);
@@ -465,9 +445,6 @@ export default function App() {
       scanConcurrency: Number(form.scanConcurrency),
       max_consecutive_sl: Number(form.max_consecutive_sl),
       sl_filter_hours: Number(form.sl_filter_hours),
-      sl_cooldown_minutes: Number(form.sl_cooldown_minutes ?? DEFAULTS.sl_cooldown_minutes),
-      severe_sl_pct: Number(form.severe_sl_pct ?? DEFAULTS.severe_sl_pct),
-      severe_sl_cooldown_hours: Number(form.severe_sl_cooldown_hours ?? DEFAULTS.severe_sl_cooldown_hours),
       leverage: Number(form.leverage),
       exec_mode: (form.mode === 'swap' ? form.exec_mode : 'sim') as ExecMode,
       confirm_on_close: form.confirm_on_close,
@@ -491,7 +468,7 @@ export default function App() {
         scan: ScanStatus;
         signals: SignalRow[];
         positions: PositionRow[];
-        filtered?: FilteredItem[];
+        filtered?: { instId: string; streak: number; filteredUntil: string; reason?: string }[];
         pnl?: PnLDashboard;
         logs: LogItem[];
         feed?: string;
@@ -1232,41 +1209,7 @@ export default function App() {
               />
             </div>
             <div className="field">
-              <label>普通止损冷却(分钟)</label>
-              <input
-                type="number"
-                min="0"
-                max="1440"
-                value={form.sl_cooldown_minutes ?? DEFAULTS.sl_cooldown_minutes}
-                onChange={(e) => setField('sl_cooldown_minutes', e.target.value)}
-              />
-              <div className="hint">止损平仓后该币暂停开仓的分钟数，默认 60；0 = 不冷却</div>
-            </div>
-            <div className="field">
-              <label>严重止损阈值(%)</label>
-              <input
-                type="number"
-                min="0.5"
-                max="50"
-                step="0.1"
-                value={form.severe_sl_pct ?? DEFAULTS.severe_sl_pct}
-                onChange={(e) => setField('severe_sl_pct', e.target.value)}
-              />
-              <div className="hint">实际平仓亏损（价格变动，不含杠杆）≥ 此值按严重止损处理，默认 3</div>
-            </div>
-            <div className="field">
-              <label>严重止损冷却(小时)</label>
-              <input
-                type="number"
-                min="0"
-                max="168"
-                value={form.severe_sl_cooldown_hours ?? DEFAULTS.severe_sl_cooldown_hours}
-                onChange={(e) => setField('severe_sl_cooldown_hours', e.target.value)}
-              />
-              <div className="hint">严重止损（或强平）后该币暂停开仓的小时数，默认 24</div>
-            </div>
-            <div className="field">
-              <label>窗口内止损次数后过滤</label>
+              <label>连续止损次数后过滤</label>
               <input
                 type="number"
                 min="1"
@@ -1274,7 +1217,7 @@ export default function App() {
                 value={form.max_consecutive_sl}
                 onChange={(e) => setField('max_consecutive_sl', e.target.value)}
               />
-              <div className="hint">同一币在「过滤时长」窗口内累计止损达此次数后暂停开仓（中间止盈不清零）</div>
+              <div className="hint">同一币连续止损达此次数后暂停开仓</div>
             </div>
             <div className="field">
               <label>过滤时长（小时）</label>
@@ -1285,7 +1228,7 @@ export default function App() {
                 value={form.sl_filter_hours}
                 onChange={(e) => setField('sl_filter_hours', e.target.value)}
               />
-              <div className="hint">同时是止损计数窗口，默认 24；填 0 表示长期过滤（可手动解除）</div>
+              <div className="hint">默认 24；填 0 表示长期过滤（可手动解除）</div>
             </div>
             <div className="field">
               <label>风控：单日亏损上限 USDT</label>
@@ -1480,18 +1423,13 @@ export default function App() {
                           <span className="pill warn">已跳过</span>
                           <div className="skip-reason">
                             {s.skipReason}
-                            {s.skipUntil && !s.cooldown ? `（${new Date(s.skipUntil).toLocaleTimeString('zh-CN', { hour12: false })} 前不重试）` : ''}
+                            {s.skipUntil ? `（${new Date(s.skipUntil).toLocaleTimeString('zh-CN', { hour12: false })} 前不重试）` : ''}
                           </div>
                         </>
                       ) : s.signal && s.submitting ? (
                         <span className="pill warn">提交中</span>
                       ) : s.signal ? (
                         <span className="pill on">触发</span>
-                      ) : s.cooldown ? (
-                        <>
-                          <span className="pill">冷却</span>
-                          <div className="skip-reason">{s.cooldown.text}</div>
-                        </>
                       ) : (
                         <span className="pill">—</span>
                       )}
@@ -1650,7 +1588,7 @@ export default function App() {
 
       <section className="card">
         <div className="card-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h2 style={{ margin: 0 }}>同币冷却 / 止损过滤</h2>
+          <h2 style={{ margin: 0 }}>连续止损过滤</h2>
           <span className="table-meta">{filtered.length} 个币暂停开仓</span>
         </div>
         <div className="table-wrap">
@@ -1658,11 +1596,8 @@ export default function App() {
             <thead>
               <tr>
                 <th>交易对</th>
-                <th>模式</th>
-                <th>类型</th>
-                <th>窗口内止损</th>
-                <th>冷却至</th>
-                <th>剩余</th>
+                <th>连续止损</th>
+                <th>过滤至</th>
                 <th>原因</th>
                 <th></th>
               </tr>
@@ -1670,19 +1605,16 @@ export default function App() {
             <tbody>
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="empty-cell">
-                    暂无。止损平仓后的冷却币（普通 / 严重 / 窗口内多次止损）会出现在这里。
+                  <td colSpan={5} className="empty-cell">
+                    暂无。同一币连续止损达到阈值后会出现在这里。
                   </td>
                 </tr>
               ) : (
                 filtered.map((f) => (
-                  <tr key={`${f.exec_mode || 'sim'}-${f.instId}`}>
+                  <tr key={f.instId}>
                     <td className="mono">{f.instId}</td>
-                    <td>{EXEC_TEXT[f.exec_mode || 'sim'] || f.exec_mode}</td>
-                    <td>{f.kindText || '连续止损'}</td>
                     <td className="mono">{f.streak}</td>
                     <td className="mono">{localTs(f.filteredUntil)}</td>
-                    <td className="mono">{f.remainingText || '—'}</td>
                     <td>{f.reason || '—'}</td>
                     <td>
                       <button
@@ -1692,7 +1624,7 @@ export default function App() {
                           try {
                             await api('/api/filtered/clear', {
                               method: 'POST',
-                              body: JSON.stringify({ instId: f.instId, exec_mode: f.exec_mode }),
+                              body: JSON.stringify({ instId: f.instId }),
                             });
                             await refreshStatus();
                           } catch (e) {

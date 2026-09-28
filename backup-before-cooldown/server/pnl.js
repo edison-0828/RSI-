@@ -6,7 +6,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { usedKeysFromTrades } from './closeMatch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, 'data');
@@ -108,20 +107,12 @@ export function recordClose(pos, exitPrice, action, profitPct, extra = {}) {
     profile: pos.profile || 'demo',
     mode: pos.mode || 'spot',
     simulated: execMode === 'sim' ? pos.simulated !== false : false,
-    // 交易所模式：开仓订单号与所用平仓记录键（防止同一平仓记录被多个仓位重复使用）
-    ordId: pos.ordId || null,
-    close_key: extra?.close_key || null,
   };
   const L = ledgerFor(execMode);
   L.trades.unshift(trade);
   if (L.trades.length > MAX_TRADES) L.trades.length = MAX_TRADES;
   saveOne(L);
   return trade;
-}
-
-/** 该模式账本里已被使用的交易所平仓记录键 */
-export function usedCloseKeys(execMode) {
-  return usedKeysFromTrades(tradesOf(execMode));
 }
 
 /** 今日（本地时区）已实现盈亏；execMode 为空则统计全部 */
