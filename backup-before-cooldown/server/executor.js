@@ -15,7 +15,6 @@
  *      失败 → 立即市价平仓（fail-safe）
  */
 import { OkxRestClient, OkxApiError } from './okxRest.js';
-import { pickCloseRecord, closeKeyOf } from './closeMatch.js';
 
 const INST_TTL_MS = 6 * 3600 * 1000;
 /** 实盘杠杆硬上限（后端强制） */
@@ -504,8 +503,6 @@ export class OkxExecutor {
         amount_config: amount,
         at: new Date().toISOString(),
         opened_ts: Date.now(),
-        // 交易所时钟的开仓订单创建时间（用于匹配平仓记录，避免误用上一笔仓位的平仓记录）
-        order_cts: Number(od?.cTime) || Number(od?.fillTime) || null,
         profile,
         mode: 'swap',
         status: 'open',
@@ -669,10 +666,14 @@ export class OkxExecutor {
    * 仓位消失后，查询平仓结果（/api/v5/account/positions-history：realizedPnl 已含手续费与资金费）
    * @returns {Promise<null|object>}
    */
-  async resolveClose(pos, usedKeys = new Set()) {
+  async resolveClose(pos) {
     const rows = await this.client.getPositionsHistory({ instType: 'SWAP', instId: pos.instId, limit: '20' });
-    // 只匹配本仓位开仓之后、且未被其它仓位使用过的平仓记录；找不到则返回 null（下轮重试）
-    const h = pickCloseRecord(rows, pos, usedKeys);
+    const openedTs = Number(pos.opened_ts || new Date(pos.at).getTime() || 0);
+    const cand = (rows || [])
+      .filter((r) => r.direction === 'long' || r.posSide === 'long')
+      .filter((r) => Number(r.uTime) >= openedTs - 5000)
+      .sort((a, b) => Number(b.uTime) - Number(a.uTime));
+    const h = cand[0];
     if (!h) return null;
 
     let action = null;
@@ -705,7 +706,6 @@ export class OkxExecutor {
       action,
       inferred,
       uTime: Number(h.uTime),
-      close_key: closeKeyOf(pos.instId, h),
       // 整个仓位生命周期的累计平仓张数 / 开仓均价（用于账本记录真实仓位规模）
       closeTotalPos: Number(h.closeTotalPos) || null,
       openAvgPx: Number(h.openAvgPx) || null,
