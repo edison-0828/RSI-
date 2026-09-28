@@ -13,7 +13,6 @@ import { calcRsi } from './rsi.js';
 import { CandleStore } from './candleStore.js';
 import { recordClose, clearTrades, buildPnLDashboard, todayRealized, usedCloseKeys, listTrades } from './pnl.js';
 import { CoinGuard, clampGuardCfg, GUARD_DEFAULTS } from './coinGuard.js';
-import { BB_DEFAULTS, clampBbCfg, applyBbFilter } from './bbFilter.js';
 import { OkxWsManager, barToCandleChannel } from './okxWs.js';
 import { loadEnvLocal } from './env.js';
 import { OkxExecutor, demoKeysConfigured, liveKeysConfigured, keysConfiguredFor, reasonText, LIVE_MAX_LEVERAGE } from './executor.js';
@@ -219,10 +218,6 @@ const DEFAULT_SCAN = {
   max_spread_pct: 0.3,
   // 需收盘确认：额外要求最近已收盘 K 线 RSI 也低于阈值（默认关闭）
   confirm_on_close: false,
-  // 布林带下轨过滤（默认关闭）：打开后要求 RSI 已触发 且 实时价 < 下轨（扫描周期、bb_period 根、bb_mult 倍总体标准差）
-  bb_filter_enabled: BB_DEFAULTS.bb_filter_enabled,
-  bb_period: BB_DEFAULTS.bb_period,
-  bb_mult: BB_DEFAULTS.bb_mult,
   // 永续专用（现货忽略）：固定多头 + 全仓 + USDT 下单，杠杆可选
   leverage: 1,
   tdMode: 'cross',
@@ -301,7 +296,6 @@ function clampConfig(body = {}) {
   else if (cfg.exec_mode === 'okx_demo') cfg.profile = 'demo';
   if (cfg.exec_mode === 'okx_live') cfg.leverage = Math.min(cfg.leverage, LIVE_MAX_LEVERAGE);
   cfg.confirm_on_close = cfg.confirm_on_close === true || cfg.confirm_on_close === 'true' || cfg.confirm_on_close === 1;
-  Object.assign(cfg, clampBbCfg(cfg)); // bb_filter_enabled / bb_period / bb_mult（旧配置缺字段 → 默认值）
   {
     const dl = Number(cfg.daily_loss_limit_usdt);
     cfg.daily_loss_limit_usdt = Number.isFinite(dl) && dl >= 0 ? Math.min(dl, 1e9) : 50;
@@ -1253,10 +1247,6 @@ function recheckBuyCondition(instId, execMode) {
       reason: `实时RSI=${f(rsiRt)} 收盘RSI=${f(rsiClosed)}，已不满足 RSI<${cfg.rsi_buy_threshold}${cfg.confirm_on_close ? '（需收盘确认）' : ''}`,
     };
   }
-  if (cfg.bb_filter_enabled) {
-    const bb = applyBbFilter(true, { closes: candleStore.closes(instId), price: snap.price }, cfg);
-    if (!bb.signal) return { ok: false, rsi: rsiRt, rsiClosed, reason: bb.reason };
-  }
   return { ok: true, rsi: rsiRt, rsiClosed };
 }
 
@@ -1286,21 +1276,13 @@ function evaluateSignals({ quiet = false } = {}) {
     // okx_demo：模拟盘不存在的合约（自选/持仓里的）永不触发
     const notOnDemo = execMode === 'okx_demo' && cfg.mode === 'swap' && !demoHasInst(instId);
     const sig = buySignalFromRsi(rsiShow, rsiClosed, cfg);
-    const price = snap.price ?? uni?.price ?? null;
-    // 布林带下轨过滤（开关关闭时 bb.signal === sig.signal，行为不变）：只在 RSI 已触发之后判断；
-    // 被挡住时不进入开仓环节 → 不写跳过冷却、不影响同币冷却计数
-    const bb = cfg.bb_filter_enabled
-      ? applyBbFilter(sig.signal && !notOnDemo, { closes: candleStore.closes(instId), price }, cfg)
-      : null;
     // 冷却中的币仍标记为触发，由开仓环节跳过并显示「冷却中：…，剩余xx分钟」
-    const signal = sig.signal && !notOnDemo && (!bb || bb.signal);
+    const signal = sig.signal && !notOnDemo;
+    const price = snap.price ?? uni?.price ?? null;
     let signalText;
     if (notOnDemo) signalText = '模拟盘无此合约';
     else if (!rsiValid) signalText = 'RSI 无效（K 线不足或无数据）';
-    else if (bb?.blocked) {
-      signalText = `RSI 已触发，${bb.reason}`;
-      if (!quiet) logThrottled(`bb:${instId}:${bb.kind}`, 'info', `${instId} RSI 已触发，${bb.reason}，不买入`, 30 * 60 * 1000);
-    } else if (signal) {
+    else if (signal) {
       signalText = cfg.confirm_on_close
         ? '实时与收盘 RSI 均低于阈值（收盘确认），触发买入！'
         : snap.forming
@@ -1321,9 +1303,6 @@ function evaluateSignals({ quiet = false } = {}) {
       notOnDemo,
       signal,
       signalText,
-      bbLower: bb?.lower ?? null,
-      bbBlocked: !!bb?.blocked,
-      bbReason: bb?.blocked ? bb.reason : null,
       skipped: false,
       skipReason: null,
       skipUntil: null,
@@ -2030,9 +2009,7 @@ app.post('/api/scan/start', async (req, res) => {
       : ' | 本地模拟（不下真实订单）';
     pushLog(
       'info',
-      `开始全市场扫描(WebSocket) mode=${cfg.mode} bar=${cfg.bar} 实时RSI<${cfg.rsi_buy_threshold}${cfg.confirm_on_close ? '（需收盘确认）' : ''}${
-        cfg.bb_filter_enabled ? ` 且价<布林下轨(${cfg.bb_period},${cfg.bb_mult})` : ''
-      } limit=${cfg.universeLimit} 评估间隔=${cfg.refreshSec}s${
+      `开始全市场扫描(WebSocket) mode=${cfg.mode} bar=${cfg.bar} 实时RSI<${cfg.rsi_buy_threshold}${cfg.confirm_on_close ? '（需收盘确认）' : ''} limit=${cfg.universeLimit} 评估间隔=${cfg.refreshSec}s${
         cfg.mode === 'swap' ? ` 杠杆=${cfg.leverage}x 全仓多头 USDT` : ''
       }${liveNote}`
     );

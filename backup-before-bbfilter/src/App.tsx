@@ -35,9 +35,6 @@ interface FormState {
   watchlist: string;
   exec_mode: ExecMode;
   confirm_on_close: boolean;
-  bb_filter_enabled: boolean;
-  bb_period: string;
-  bb_mult: string;
   daily_loss_limit_usdt: string;
   max_orders_per_hour: string;
   max_spread_pct: string;
@@ -59,11 +56,6 @@ interface SignalRow {
   filtered?: boolean;
   cooldown?: { kind: string; until: string; text: string; reason?: string } | null;
   notOnDemo?: boolean;
-  /** 布林带下轨（仅开关打开时有值） */
-  bbLower?: number | null;
-  /** RSI 已触发但被布林带过滤挡住 */
-  bbBlocked?: boolean;
-  bbReason?: string | null;
   skipped?: boolean;
   skipReason?: string | null;
   skipUntil?: string | null;
@@ -295,9 +287,6 @@ const DEFAULTS: FormState = {
   watchlist: '',
   exec_mode: 'sim',
   confirm_on_close: false,
-  bb_filter_enabled: false,
-  bb_period: '20',
-  bb_mult: '2',
   daily_loss_limit_usdt: '50',
   max_orders_per_hour: '10',
   max_spread_pct: '0.3',
@@ -366,24 +355,6 @@ const RSI_DIP: StrategyDef = {
       hint: '勾选后还要求最近已收盘 K 线 RSI 也低于阈值（默认不勾选）',
       advanced: true,
       control: { kind: 'switch', text: '要求已收盘 K 线同时满足' },
-    },
-    {
-      key: 'bb_filter_enabled',
-      label: '布林带下轨过滤',
-      hint: 'RSI 触发后，还要求实时价低于布林下轨才买入（按 K 线周期计算，默认关闭）',
-      control: { kind: 'switch', text: '布林带下轨过滤（实时价需低于下轨）' },
-    },
-    {
-      key: 'bb_period',
-      label: '布林带周期',
-      hint: '前 N−1 根已收盘 K 线 + 实时价，默认 20',
-      control: { kind: 'number', min: 2, max: 100, step: 1 },
-    },
-    {
-      key: 'bb_mult',
-      label: '布林带倍数（标准差）',
-      hint: '下轨 = 均值 − 倍数 × 标准差，默认 2',
-      control: { kind: 'number', min: 0.1, max: 10, step: 0.1 },
     },
   ],
   presets: [
@@ -554,7 +525,6 @@ function signalState(s: SignalRow) {
   if (s.signal && s.skipped) return { label: '已跳过', tone: 'warn', detail: s.skipReason || '' };
   if (s.signal && s.submitting) return { label: '提交中', tone: 'warn', detail: '' };
   if (s.signal) return { label: '已触发', tone: 'active', detail: s.signalText || '' };
-  if (s.bbBlocked) return { label: '布林未破', tone: 'warn', detail: s.bbReason || '' };
   if (s.filtered) return { label: '风控过滤', tone: 'muted', detail: s.signalText || '' };
   return { label: '观察中', tone: 'neutral', detail: '' };
 }
@@ -802,9 +772,6 @@ export default function App() {
       leverage: Number(form.leverage),
       exec_mode: (form.mode === 'swap' ? form.exec_mode : 'sim') as ExecMode,
       confirm_on_close: form.confirm_on_close,
-      bb_filter_enabled: form.bb_filter_enabled === true,
-      bb_period: Number(form.bb_period ?? DEFAULTS.bb_period),
-      bb_mult: Number(form.bb_mult ?? DEFAULTS.bb_mult),
       daily_loss_limit_usdt: Number(form.daily_loss_limit_usdt),
       max_orders_per_hour: Number(form.max_orders_per_hour),
       max_spread_pct: Number(form.max_spread_pct),
@@ -1106,7 +1073,7 @@ export default function App() {
       all: signals.length,
       triggered: signals.filter((s) => s.signal && !s.skipped).length,
       watchlist: signals.filter((s) => s.watchlist).length,
-      skipped: signals.filter((s) => s.skipped || s.filtered || s.notOnDemo || s.bbBlocked).length,
+      skipped: signals.filter((s) => s.skipped || s.filtered || s.notOnDemo).length,
     }),
     [signals],
   );
@@ -1116,7 +1083,7 @@ export default function App() {
       if (query && !s.instId.toUpperCase().includes(query)) return false;
       if (signalFilter === 'triggered') return s.signal && !s.skipped;
       if (signalFilter === 'watchlist') return !!s.watchlist;
-      if (signalFilter === 'skipped') return !!(s.skipped || s.filtered || s.notOnDemo || s.bbBlocked);
+      if (signalFilter === 'skipped') return !!(s.skipped || s.filtered || s.notOnDemo);
       return true;
     });
     const rsiValue = (s: SignalRow) => (s.rsi != null && Number.isFinite(s.rsi) && s.rsi > 0 ? s.rsi : Number.POSITIVE_INFINITY);
@@ -2002,9 +1969,6 @@ export default function App() {
                     <td className="mono">{fmtVol(s.volUsd24h)}</td>
                     <td>
                       <FlashNum value={s.price} className="mono">${fmtPrice(s.price)}</FlashNum>
-                      {s.bbLower != null && Number.isFinite(s.bbLower) ? (
-                        <div className="table-meta" title="布林带下轨（实时）">下轨 {fmtPrice(s.bbLower)}</div>
-                      ) : null}
                     </td>
                     <td className="mono">
                       <span className={`rsi-chip ${rsiTone(s.rsi, activeRsiThreshold)}`}>{fmtRsi(s.rsi)}</span>
@@ -2028,11 +1992,6 @@ export default function App() {
                         <span className="pill warn">提交中</span>
                       ) : s.signal ? (
                         <span className="pill on">触发</span>
-                      ) : s.bbBlocked ? (
-                        <>
-                          <span className="pill warn">布林未破</span>
-                          <div className="skip-reason">{s.bbReason}</div>
-                        </>
                       ) : s.cooldown ? (
                         <>
                           <span className="pill">冷却</span>

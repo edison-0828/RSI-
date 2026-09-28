@@ -138,12 +138,6 @@ export class CandleStore {
     return entry;
   }
 
-  /** 已收盘收盘价副本（从旧到新），供布林带等指标使用 */
-  closes(instId) {
-    const e = this.get(instId);
-    return e ? [...e.closes] : [];
-  }
-
   get(instId) {
     return this.map.get(instId) || null;
   }
