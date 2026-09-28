@@ -4,8 +4,15 @@ type Profile = 'demo' | 'live';
 type Mode = 'spot' | 'swap';
 type Bar = '1m' | '5m' | '15m' | '1H' | '4H' | '1Dutc';
 type ExecMode = 'sim' | 'okx_demo' | 'okx_live';
+type SignalFilter = 'all' | 'triggered' | 'watchlist' | 'skipped';
+type SignalSort = 'priority' | 'rsi' | 'volume' | 'updated';
+type LowerTab = 'positions' | 'history' | 'filtered' | 'logs';
+type SettingsTab = 'strategy' | 'shared';
+type StrategyId = 'rsi_dip';
+type PresetId = 'conservative' | 'balanced' | 'aggressive';
 
 interface FormState {
+  strategy: StrategyId;
   amount: string;
   bar: Bar;
   rsi_period: string;
@@ -59,6 +66,8 @@ interface PositionRow {
   profit_pct?: number | null;
   take_profit_price?: number;
   stop_loss_price?: number;
+  take_profit_pct?: number;
+  stop_loss_pct?: number;
   simulated?: boolean;
   status?: string;
   at?: string;
@@ -238,6 +247,7 @@ interface PnLDashboard {
 }
 
 const DEFAULTS: FormState = {
+  strategy: 'rsi_dip',
   amount: '100',
   bar: '15m',
   rsi_period: '6',
@@ -262,6 +272,99 @@ const DEFAULTS: FormState = {
   max_spread_pct: '0.3',
 };
 
+const BARS: Bar[] = ['1m', '5m', '15m', '1H', '4H', '1Dutc'];
+
+/** 策略自己的一个参数项；key 指向 FormState，加策略时只需在这里声明，UI 自动渲染 */
+interface StrategyField {
+  key: keyof FormState;
+  label: string;
+  hint?: string;
+  /** 放进「高级参数」折叠区，默认只露出核心参数 */
+  advanced?: boolean;
+  control:
+    | { kind: 'number'; min?: number; max?: number; step?: number }
+    | { kind: 'select'; options: { value: string; label: string }[] }
+    | { kind: 'switch'; text: string };
+}
+
+interface StrategyPreset {
+  id: PresetId;
+  label: string;
+  desc: string;
+  values: Partial<FormState>;
+}
+
+/** 一个策略的完整声明：新增策略 = 在 STRATEGIES 里加一项 + 在 FormState 补它的参数键 */
+interface StrategyDef {
+  id: StrategyId;
+  name: string;
+  /** 策略库里的一句话说明 */
+  tagline: string;
+  tags: string[];
+  /** 策略卡上的一行参数摘要 */
+  summary: (f: FormState) => string;
+  fields: StrategyField[];
+  presets: StrategyPreset[];
+}
+
+const RSI_DIP: StrategyDef = {
+  id: 'rsi_dip',
+  name: 'RSI 抄底',
+  tagline: 'RSI 跌破阈值时买入，等超卖反弹',
+  tags: ['超卖反弹', '做多', '短中线'],
+  summary: (f) =>
+    `RSI(${f.rsi_period}) < ${f.rsi_buy_threshold} · ${f.bar} · 止盈 ${f.take_profit_pct}% / 止损 ${f.stop_loss_pct}%`,
+  fields: [
+    {
+      key: 'bar',
+      label: 'K线周期 bar',
+      control: { kind: 'select', options: BARS.map((b) => ({ value: b, label: b })) },
+    },
+    { key: 'rsi_period', label: 'RSI 周期', control: { kind: 'number', min: 2 } },
+    {
+      key: 'rsi_buy_threshold',
+      label: '买入阈值（RSI <）',
+      hint: '按实时 RSI（含未收盘 K 线）判定；建议 25–35',
+      control: { kind: 'number' },
+    },
+    { key: 'take_profit_pct', label: '止盈 %', control: { kind: 'number', step: 0.1 } },
+    { key: 'stop_loss_pct', label: '止损 %', control: { kind: 'number', step: 0.1 } },
+    {
+      key: 'confirm_on_close',
+      label: '需收盘确认',
+      hint: '勾选后还要求最近已收盘 K 线 RSI 也低于阈值（默认不勾选）',
+      advanced: true,
+      control: { kind: 'switch', text: '要求已收盘 K 线同时满足' },
+    },
+  ],
+  presets: [
+    {
+      id: 'conservative',
+      label: '保守',
+      desc: '长周期 + 更深超卖 + 收盘确认，信号少但更稳',
+      values: { bar: '1H', rsi_period: '14', rsi_buy_threshold: '15', confirm_on_close: true, take_profit_pct: '6', stop_loss_pct: '4' },
+    },
+    {
+      id: 'balanced',
+      label: '均衡',
+      desc: '默认参数：15 分钟周期，RSI(6) < 20',
+      values: { bar: '15m', rsi_period: '6', rsi_buy_threshold: '20', confirm_on_close: false, take_profit_pct: '8', stop_loss_pct: '6' },
+    },
+    {
+      id: 'aggressive',
+      label: '激进',
+      desc: '短周期 + 浅超卖，信号多、噪音也多',
+      values: { bar: '5m', rsi_period: '6', rsi_buy_threshold: '28', confirm_on_close: false, take_profit_pct: '12', stop_loss_pct: '8' },
+    },
+  ],
+};
+
+const STRATEGIES: StrategyDef[] = [RSI_DIP];
+
+function getStrategy(id: StrategyId): StrategyDef {
+  return STRATEGIES.find((s) => s.id === id) || STRATEGIES[0];
+}
+
 /** 实盘保守默认值（切到实盘时，若该模式没有保存过配置则套用；止盈止损沿用当前设置） */
 const LIVE_FORM_DEFAULTS: Partial<FormState> = {
   amount: '20',
@@ -273,7 +376,31 @@ const LIVE_FORM_DEFAULTS: Partial<FormState> = {
 /** 按执行方式分开保存的字段 */
 const MODE_FIELDS: (keyof FormState)[] = ['amount', 'leverage', 'max_positions', 'daily_loss_limit_usdt', 'max_orders_per_hour'];
 const MODE_CFG_KEY = (m: ExecMode) => `rsi-bottom-hunter:mode-cfg:${m}`;
+const SETTINGS_KEY = 'rsi-bottom-hunter:strategy-settings';
 const LIVE_CONFIRM_TEXT = '确认实盘';
+
+interface StoredSettings {
+  form: FormState;
+  savedAt: string;
+}
+
+function loadSavedSettings(): StoredSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<StoredSettings>;
+      if (parsed.form && typeof parsed.form === 'object') {
+        return {
+          form: { ...DEFAULTS, ...parsed.form },
+          savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : '',
+        };
+      }
+    }
+  } catch {
+    /* fall back to defaults */
+  }
+  return { form: DEFAULTS, savedAt: '' };
+}
 
 function loadModeCfg(m: ExecMode): Partial<FormState> | null {
   try {
@@ -334,6 +461,12 @@ function fmtVol(n: number | null | undefined) {
   return n.toFixed(0);
 }
 
+/** 按开仓时的百分比快照反算止盈/止损价；没有快照就返回 null（显示 —），不拿当前设置冒充 */
+function exitPrice(entry: number, pct: number | null | undefined, sign: 1 | -1) {
+  if (pct == null || !Number.isFinite(pct) || pct <= 0) return null;
+  return entry * (1 + (sign * pct) / 100);
+}
+
 function fmtUsdt(n: number | null | undefined) {
   if (n == null || !Number.isFinite(n)) return '—';
   const sign = n > 0 ? '+' : '';
@@ -353,6 +486,36 @@ function localTs(iso: string) {
   }
 }
 
+function relativeTs(iso?: string) {
+  if (!iso) return '—';
+  const time = new Date(iso).getTime();
+  if (!Number.isFinite(time)) return '—';
+  const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+  if (seconds < 5) return '刚刚';
+  if (seconds < 60) return `${seconds} 秒前`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return localTs(iso);
+}
+
+function signalState(s: SignalRow) {
+  if (s.notOnDemo) return { label: '模拟盘无此合约', tone: 'muted', detail: '' };
+  if (s.signal && s.skipped) return { label: '已跳过', tone: 'warn', detail: s.skipReason || '' };
+  if (s.signal && s.submitting) return { label: '提交中', tone: 'warn', detail: '' };
+  if (s.signal) return { label: '已触发', tone: 'active', detail: s.signalText || '' };
+  if (s.filtered) return { label: '风控过滤', tone: 'muted', detail: s.signalText || '' };
+  return { label: '观察中', tone: 'neutral', detail: '' };
+}
+
+function rsiTone(rsi: number | null | undefined, threshold: number) {
+  if (rsi == null || !Number.isFinite(rsi) || rsi <= 0) return 'invalid';
+  if (rsi < threshold) return 'hot';
+  if (rsi < threshold + 8) return 'warm';
+  return 'normal';
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
@@ -365,8 +528,36 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+/** 数值变化时短暂高亮，让 2.5 秒一次的刷新能被看见 */
+function FlashNum({
+  value,
+  children,
+  className = '',
+}: {
+  value: number | null | undefined;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const prev = useRef(value);
+  const [dir, setDir] = useState<'' | 'up' | 'down'>('');
+  useEffect(() => {
+    const before = prev.current;
+    prev.current = value;
+    if (before == null || value == null || !Number.isFinite(before) || !Number.isFinite(value)) return;
+    if (before === value) return;
+    setDir(value > before ? 'up' : 'down');
+    const t = setTimeout(() => setDir(''), 700);
+    return () => clearTimeout(t);
+  }, [value]);
+  return <span className={`flash ${dir} ${className}`.trim()}>{children}</span>;
+}
+
 export default function App() {
-  const [form, setForm] = useState<FormState>(DEFAULTS);
+  const [initialSettings] = useState<StoredSettings>(() => loadSavedSettings());
+  const [form, setForm] = useState<FormState>(initialSettings.form);
+  const [savedForm, setSavedForm] = useState<FormState>(initialSettings.form);
+  const [settingsSavedAt, setSettingsSavedAt] = useState(initialSettings.savedAt);
+  const [settingsSaveState, setSettingsSaveState] = useState<'idle' | 'saved' | 'error'>('idle');
   const [signals, setSignals] = useState<SignalRow[]>([]);
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [filtered, setFiltered] = useState<
@@ -385,6 +576,18 @@ export default function App() {
   const [accountMsg, setAccountMsg] = useState<string | null>(null);
   const [accountLoading, setAccountLoading] = useState(false);
   const [killBusy, setKillBusy] = useState(false);
+  const [closeModal, setCloseModal] = useState<{ pos: PositionRow | null; busy: boolean; error: string | null }>({
+    pos: null,
+    busy: false,
+    error: null,
+  });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('strategy');
+  const [strategyPickerOpen, setStrategyPickerOpen] = useState(false);
+  const [signalQuery, setSignalQuery] = useState('');
+  const [signalFilter, setSignalFilter] = useState<SignalFilter>('all');
+  const [signalSort, setSignalSort] = useState<SignalSort>('priority');
+  const [lowerTab, setLowerTab] = useState<LowerTab>('positions');
   const [liveModal, setLiveModal] = useState<{ open: boolean; loading: boolean; check: LiveCheckResult | null; text: string; error: string | null; starting: boolean }>({
     open: false,
     loading: false,
@@ -394,9 +597,95 @@ export default function App() {
     starting: false,
   });
   const prevMode = useRef(form.mode);
+  const settingsDirty = useMemo(() => JSON.stringify(form) !== JSON.stringify(savedForm), [form, savedForm]);
 
   const setField = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((f) => ({ ...f, [key]: value }));
+    setSettingsSaveState('idle');
+  };
+
+  const saveSettings = () => {
+    try {
+      const savedAt = new Date().toISOString();
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify({ form, savedAt } satisfies StoredSettings));
+      saveModeCfg(form.exec_mode, form);
+      setSavedForm(form);
+      setSettingsSavedAt(savedAt);
+      setSettingsSaveState('saved');
+      return true;
+    } catch {
+      setSettingsSaveState('error');
+      return false;
+    }
+  };
+
+  const activeStrategy = getStrategy(form.strategy);
+  const activePreset = useMemo(() => {
+    const hit = activeStrategy.presets.find((p) =>
+      (Object.keys(p.values) as (keyof FormState)[]).every((k) => form[k] === p.values[k])
+    );
+    return hit?.id ?? null;
+  }, [activeStrategy, form]);
+
+  const applyPatch = (patch: Partial<FormState>) => {
+    setForm((f) => ({ ...f, ...patch }));
+    setSettingsSaveState('idle');
+  };
+
+  /** 切换策略：套用目标策略的「均衡」预设作为基线，资金/风控/扫描等通用参数保持不变 */
+  const selectStrategy = (id: StrategyId) => {
+    setStrategyPickerOpen(false);
+    if (id === form.strategy) return;
+    const next = getStrategy(id);
+    const base = next.presets.find((p) => p.id === 'balanced')?.values || {};
+    applyPatch({ ...base, strategy: id });
+    setSettingsTab('strategy');
+    setModeHint(`已切换到「${next.name}」策略${scan.running ? '，需重新开始扫描后生效' : ''}`);
+  };
+
+  /** 按 StrategyField 声明渲染一个输入项，新增策略不必改 JSX */
+  const renderStrategyField = (f: StrategyField) => {
+    const control = f.control;
+    const raw = form[f.key];
+    return (
+      <div className="field" key={f.key}>
+        <label>{f.label}</label>
+        {control.kind === 'select' ? (
+          <select value={String(raw)} onChange={(e) => applyPatch({ [f.key]: e.target.value } as Partial<FormState>)}>
+            {control.options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        ) : control.kind === 'switch' ? (
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={raw === true}
+              onChange={(e) => applyPatch({ [f.key]: e.target.checked } as Partial<FormState>)}
+            />
+            <span>{control.text}</span>
+          </label>
+        ) : (
+          <input
+            type="number"
+            min={control.min}
+            max={control.max}
+            step={control.step}
+            value={String(raw)}
+            onChange={(e) => applyPatch({ [f.key]: e.target.value } as Partial<FormState>)}
+          />
+        )}
+        {f.hint && <div className="hint">{f.hint}</div>}
+      </div>
+    );
+  };
+
+  const restoreSavedSettings = () => {
+    setForm(savedForm);
+    setModeHint(null);
+    setSettingsSaveState('idle');
   };
 
   /** 切换执行方式：保存当前模式的资金/风控参数，载入目标模式已保存的参数；首次切实盘套用保守默认值 */
@@ -407,6 +696,7 @@ export default function App() {
     const saved = loadModeCfg(next);
     const patch = saved || (next === 'okx_live' ? LIVE_FORM_DEFAULTS : {});
     setForm({ ...f, ...patch, exec_mode: next });
+    setSettingsSaveState('idle');
     if (next === 'okx_live') {
       setModeHint(
         saved
@@ -418,10 +708,21 @@ export default function App() {
     }
   };
 
-  // 当前模式的资金/风控参数随改随存（按执行方式分开）
   useEffect(() => {
-    saveModeCfg(form.exec_mode, form);
-  }, [form]);
+    if (!settingsOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (strategyPickerOpen) setStrategyPickerOpen(false);
+      else setSettingsOpen(false);
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [settingsOpen, strategyPickerOpen]);
 
   const payload = useMemo(() => {
     const watchlist = form.watchlist
@@ -666,6 +967,19 @@ export default function App() {
     await refreshStatus();
   };
 
+  const onClosePosition = async () => {
+    const p = closeModal.pos;
+    if (!p) return;
+    setCloseModal((m) => ({ ...m, busy: true, error: null }));
+    try {
+      await api('/api/position/close', { method: 'POST', body: JSON.stringify({ instId: p.instId }) });
+      setCloseModal({ pos: null, busy: false, error: null });
+      await refreshStatus();
+    } catch (e) {
+      setCloseModal((m) => ({ ...m, busy: false, error: e instanceof Error ? e.message : String(e) }));
+    }
+  };
+
   const onKill = async (closeAll: boolean) => {
     const msg = closeAll
       ? '确认【急停并全部平仓】？\n将停止扫描、禁止开新仓，并按交易所持仓数量市价平掉本程序管理的全部 OKX 模拟盘 / 实盘持仓（撤销其止盈止损），本地模拟持仓按现价平仓。\n（交易所上非本程序开的外部仓位不会被平掉）'
@@ -699,6 +1013,13 @@ export default function App() {
   };
 
   const running = !!scan.running;
+  /** 扫描中以后端实际生效的配置为准：改了设置但没重启时，显示不会和判定逻辑脱节 */
+  const runCfgNum = (key: string, fallback: string) => {
+    const n = Number(running ? scan.config?.[key] : undefined);
+    return Number.isFinite(n) && n > 0 ? n : Number(fallback);
+  };
+  const activeRsiThreshold = runCfgNum('rsi_buy_threshold', form.rsi_buy_threshold);
+  const activeMaxPositions = runCfgNum('max_positions', form.max_positions);
   const killOn = !!exec?.risk?.kill_switch?.on;
   const isDemoExec = form.mode === 'swap' && form.exec_mode === 'okx_demo';
   const isLiveExec = form.mode === 'swap' && form.exec_mode === 'okx_live';
@@ -716,7 +1037,42 @@ export default function App() {
   const liveAcct = execSel === 'okx_live' ? acct : exec?.live?.account || null;
   const risk = exec?.risk;
   const simPositionCount = positions.filter((p) => !isExchangeMode(p.exec_mode)).length;
+  const hasExchangePos = positions.some((p) => isExchangeMode(p.exec_mode));
   const viewModeText = EXEC_TEXT[pnl?.exec_mode || execSel] || '本地模拟';
+  const dailyLossUsage = risk?.daily_loss_limit_usdt
+    ? Math.min(100, Math.max(0, (Math.max(0, -(risk.today_realized_usdt || 0)) / risk.daily_loss_limit_usdt) * 100))
+    : 0;
+  const hourlyOrderUsage = risk?.max_orders_per_hour
+    ? Math.min(100, Math.max(0, ((risk.orders_last_hour || 0) / risk.max_orders_per_hour) * 100))
+    : 0;
+  const signalCounts = useMemo(
+    () => ({
+      all: signals.length,
+      triggered: signals.filter((s) => s.signal && !s.skipped).length,
+      watchlist: signals.filter((s) => s.watchlist).length,
+      skipped: signals.filter((s) => s.skipped || s.filtered || s.notOnDemo).length,
+    }),
+    [signals],
+  );
+  const visibleSignals = useMemo(() => {
+    const query = signalQuery.trim().toUpperCase();
+    const result = signals.filter((s) => {
+      if (query && !s.instId.toUpperCase().includes(query)) return false;
+      if (signalFilter === 'triggered') return s.signal && !s.skipped;
+      if (signalFilter === 'watchlist') return !!s.watchlist;
+      if (signalFilter === 'skipped') return !!(s.skipped || s.filtered || s.notOnDemo);
+      return true;
+    });
+    const rsiValue = (s: SignalRow) => (s.rsi != null && Number.isFinite(s.rsi) && s.rsi > 0 ? s.rsi : Number.POSITIVE_INFINITY);
+    const priority = (s: SignalRow) =>
+      s.signal && !s.skipped ? 0 : s.submitting ? 1 : s.skipped ? 2 : s.watchlist ? 3 : s.filtered || s.notOnDemo ? 5 : 4;
+    return [...result].sort((a, b) => {
+      if (signalSort === 'rsi') return rsiValue(a) - rsiValue(b);
+      if (signalSort === 'volume') return (b.volUsd24h || 0) - (a.volUsd24h || 0);
+      if (signalSort === 'updated') return new Date(b.at || 0).getTime() - new Date(a.at || 0).getTime();
+      return priority(a) - priority(b) || rsiValue(a) - rsiValue(b);
+    });
+  }, [signals, signalFilter, signalQuery, signalSort]);
 
   return (
     <div className="app">
@@ -725,33 +1081,53 @@ export default function App() {
           <h1>
             <span className="accent">RSI抄底宝</span>
             <span style={{ color: 'var(--text-dim)', fontWeight: 500, fontSize: '1rem' }}>
-              · 全市场扫描
+              · 交易监控台
             </span>
           </h1>
           <div className="subtitle">
-            OKX WebSocket 行情 + 本地 Wilder RSI · 按 mode 筛 USDT → 推送驱动信号 · 本地模拟 / OKX 模拟盘 / OKX 实盘（需确认）
+            全市场 RSI 信号监控 · OKX WebSocket 实时行情 · 模拟与实盘分级执行
           </div>
         </div>
-        <div className="badge-row">
-          <span className={`badge ${showLiveBanner ? 'live' : 'demo'}`}>
-            {showLiveBanner ? '⚡ 实盘 · 真实资金' : isDemoExec ? '🧪 模拟盘 DEMO' : '🧪 本地模拟'}
-          </span>
-          <span className="badge mode">{form.mode === 'swap' ? '永续 SWAP' : '现货 Spot'}</span>
-          <span className={`badge ${isLiveExec ? 'live' : isDemoExec ? 'running' : 'mode'}`}>
-            执行：{EXEC_TEXT[execSel]}
-          </span>
-          {killOn && <span className="badge live">⛔ 急停中</span>}
-          {running && (
-            <span className="badge running">
-              ● 扫描中{scan.scanning ? '…' : ''} R{scan.round || 0}
+        <div className="header-controls">
+          <div className="badge-row">
+            <span className={`badge ${showLiveBanner ? 'live' : 'demo'}`}>
+              {showLiveBanner ? '⚡ 实盘 · 真实资金' : isDemoExec ? '🧪 模拟盘 DEMO' : '🧪 本地模拟'}
             </span>
-          )}
-          <span className="badge mode">行情源：WebSocket</span>
-          {running && (
-            <span className={`badge ${scan.ws?.connected ? 'running' : 'live'}`}>
-              WS：{scan.ws?.connected ? '已连接' : scan.ws?.reconnecting ? '重连中' : '未连接'}
+            <span className="badge mode">{form.mode === 'swap' ? '永续 SWAP' : '现货 Spot'}</span>
+            {killOn && <span className="badge live">⛔ 急停中</span>}
+            {running && (
+              <span className="badge running">
+                <span className="status-pulse" />
+                扫描中{scan.scanning ? '…' : ''} · R{scan.round || 0}
+              </span>
+            )}
+            <span className={`badge ${running && !scan.ws?.connected ? 'live' : 'mode'}`}>
+              WS：{!running ? '待机' : scan.ws?.connected ? '已连接' : scan.ws?.reconnecting ? '重连中' : '未连接'}
             </span>
-          )}
+          </div>
+          <div className="header-actions">
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => setSettingsOpen(true)}
+              aria-expanded={settingsOpen}
+            >
+              ⚙ 策略设置
+            </button>
+            {!running ? (
+              <button
+                className={`btn ${isLiveExec ? 'btn-danger' : 'btn-primary'}`}
+                onClick={() => { if (!settingsDirty || saveSettings()) onStart(); }}
+                disabled={loading || liveModal.loading}
+              >
+                {loading || liveModal.loading ? <span className="spinner" /> : '▶'} {isLiveExec ? '开始实盘' : '开始扫描'}
+              </button>
+            ) : (
+              <button className="btn btn-danger" onClick={onStop}>
+                ■ 停止扫描
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -807,104 +1183,44 @@ export default function App() {
                 清空记录
               </button>
             </div>
-            <div className="status-grid pnl-grid">
-              <div className="metric">
+            <div className="metric-primary-row">
+              <div className="metric metric-primary">
                 <div className="label">总盈亏 (USDT)</div>
-                <div className={`value mono ${pnlClass(pnl?.total_usdt)}`}>{fmtUsdt(pnl?.total_usdt)}</div>
+                <FlashNum value={pnl?.total_usdt} className={`value mono ${pnlClass(pnl?.total_usdt)}`}>
+                  {fmtUsdt(pnl?.total_usdt)}
+                </FlashNum>
               </div>
-              <div className="metric">
-                <div className="label">已实现</div>
-                <div className={`value mono ${pnlClass(pnl?.realized_usdt)}`}>{fmtUsdt(pnl?.realized_usdt)}</div>
-              </div>
-              <div className="metric">
+              <div className="metric metric-primary">
                 <div className="label">浮动盈亏</div>
-                <div className={`value mono ${pnlClass(pnl?.unrealized_usdt)}`}>{fmtUsdt(pnl?.unrealized_usdt)}</div>
+                <FlashNum value={pnl?.unrealized_usdt} className={`value mono ${pnlClass(pnl?.unrealized_usdt)}`}>
+                  {fmtUsdt(pnl?.unrealized_usdt)}
+                </FlashNum>
               </div>
-              <div className="metric">
+              <div className="metric metric-primary">
                 <div className="label">今日已实现</div>
-                <div className={`value mono ${pnlClass(pnl?.today_realized_usdt)}`}>
+                <FlashNum value={pnl?.today_realized_usdt} className={`value mono ${pnlClass(pnl?.today_realized_usdt)}`}>
                   {fmtUsdt(pnl?.today_realized_usdt)}
-                </div>
-              </div>
-              <div className="metric">
-                <div className="label">胜率</div>
-                <div className="value mono dim">
-                  {pnl?.win_rate_pct == null ? '—' : `${pnl.win_rate_pct.toFixed(1)}%`}
-                  <span className="table-meta"> ({pnl?.wins ?? 0}胜/{pnl?.losses ?? 0}负)</span>
-                </div>
-              </div>
-              <div className="metric">
-                <div className="label">平仓笔数</div>
-                <div className="value mono dim">{pnl?.closed_trades ?? 0}</div>
-              </div>
-              <div className="metric">
-                <div className="label">平均盈利</div>
-                <div className={`value mono ${pnlClass(pnl?.avg_win_usdt)}`}>{fmtUsdt(pnl?.avg_win_usdt)}</div>
-              </div>
-              <div className="metric">
-                <div className="label">平均亏损</div>
-                <div className={`value mono ${pnlClass(pnl?.avg_loss_usdt)}`}>{fmtUsdt(pnl?.avg_loss_usdt)}</div>
+                </FlashNum>
               </div>
             </div>
-            <div className="table-wrap" style={{ marginTop: 12 }}>
-              <div className="table-meta" style={{ marginBottom: 8 }}>
-                当前显示：{viewModeText}（本地模拟按估算：盈亏 ≈ 金额 × 杠杆 × 涨跌%；OKX 模拟盘 / 实盘为交易所真实已实现盈亏，含手续费/资金费）
-              </div>
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>交易对</th>
-                    <th>来源</th>
-                    <th>方向</th>
-                    <th>入场</th>
-                    <th>出场</th>
-                    <th>金额</th>
-                    <th>盈亏%</th>
-                    <th>手续费</th>
-                    <th>盈亏 USDT</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {!pnl?.recent?.length ? (
-                    <tr>
-                      <td colSpan={10} className="empty-cell">
-                        暂无平仓记录 — 止盈/止损后会出现在这里
-                      </td>
-                    </tr>
-                  ) : (
-                    pnl.recent.map((t) => (
-                      <tr key={t.id || `${t.instId}-${t.closed_at}`}>
-                        <td className="mono">{t.closed_at ? localTs(t.closed_at) : '—'}</td>
-                        <td className="mono">{t.instId}</td>
-                        <td>
-                          <span className={`tag ${t.exec_mode === 'okx_live' ? 'tag-live' : ''}`}>{EXEC_TEXT[t.exec_mode || 'sim'] || '本地模拟'}</span>
-                        </td>
-                        <td>
-                          <span className={`pill ${t.action === 'tp' ? 'on' : ''}`}>
-                            {ACTION_TEXT[t.action] || t.action}
-                          </span>
-                        </td>
-                        <td className="mono">${fmtPrice(t.entry_price)}</td>
-                        <td className="mono">${fmtPrice(t.exit_price)}</td>
-                        <td className="mono">{fmtPrice(t.amount)}</td>
-                        <td className={`mono ${pnlClass(t.profit_pct)}`}>
-                          {t.profit_pct == null
-                            ? '—'
-                            : `${t.profit_pct >= 0 ? '+' : ''}${t.profit_pct.toFixed(2)}%`}
-                        </td>
-                        <td className="mono dim">
-                          {t.fee_usdt == null ? '—' : t.fee_usdt.toFixed(4)}
-                        </td>
-                        <td className={`mono ${pnlClass(t.pnl_usdt)}`}>
-                          {fmtUsdt(t.pnl_usdt)}
-                          {isExchangeMode(t.exec_mode) && !t.pnl_exact ? <span className="tag">估算</span> : null}
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+            <div className="metric-secondary-row">
+              <span>
+                已实现 <b className={`mono ${pnlClass(pnl?.realized_usdt)}`}>{fmtUsdt(pnl?.realized_usdt)}</b>
+              </span>
+              <span>
+                胜率{' '}
+                <b className="mono">{pnl?.win_rate_pct == null ? '—' : `${pnl.win_rate_pct.toFixed(1)}%`}</b>
+                <i>{pnl?.wins ?? 0}胜 / {pnl?.losses ?? 0}负</i>
+              </span>
+              <span>
+                平仓笔数 <b className="mono">{pnl?.closed_trades ?? 0}</b>
+              </span>
+              <span>
+                平均盈利 <b className={`mono ${pnlClass(pnl?.avg_win_usdt)}`}>{fmtUsdt(pnl?.avg_win_usdt)}</b>
+              </span>
+              <span>
+                平均亏损 <b className={`mono ${pnlClass(pnl?.avg_loss_usdt)}`}>{fmtUsdt(pnl?.avg_loss_usdt)}</b>
+              </span>
             </div>
           </section>
 
@@ -935,7 +1251,7 @@ export default function App() {
               <div className="metric">
                 <div className="label">持仓 / 上限</div>
                 <div className="value dim">
-                  {positions.length} / {form.max_positions}
+                  {positions.length} / {activeMaxPositions}
                 </div>
               </div>
               <div className="metric">
@@ -959,6 +1275,9 @@ export default function App() {
                   {fmtUsdt(risk?.today_realized_usdt)} / {risk?.daily_loss_limit_usdt ? `-${risk.daily_loss_limit_usdt}` : '不限'}
                   {risk?.daily_loss_hit ? <span className="table-meta"> 已停开</span> : null}
                 </div>
+                <div className={`risk-meter ${dailyLossUsage >= 80 ? 'danger' : dailyLossUsage >= 50 ? 'warn' : ''}`}>
+                  <span style={{ width: `${dailyLossUsage}%` }} />
+                </div>
               </div>
               <div className="metric">
                 <div className="label">近 1 小时下单</div>
@@ -968,6 +1287,9 @@ export default function App() {
                   }`}
                 >
                   {risk?.orders_last_hour ?? 0} / {risk?.max_orders_per_hour ?? form.max_orders_per_hour}
+                </div>
+                <div className={`risk-meter ${hourlyOrderUsage >= 80 ? 'danger' : hourlyOrderUsage >= 50 ? 'warn' : ''}`}>
+                  <span style={{ width: `${hourlyOrderUsage}%` }} />
                 </div>
               </div>
               <div className="metric">
@@ -981,6 +1303,7 @@ export default function App() {
               <div className="metric">
                 <div className="label">WS 状态</div>
                 <div className={`value ${scan.ws?.connected ? 'teal' : running ? 'amber' : 'dim'}`}>
+                  <span className={`connection-light ${scan.ws?.connected ? 'online' : running ? 'pending' : 'offline'}`} />
                   {!running
                     ? '—'
                     : scan.ws?.connected
@@ -994,7 +1317,7 @@ export default function App() {
             <div className="signal-banner">
               {scan.note ||
                 (running
-                  ? `WebSocket 推送中 · RSI < ${form.rsi_buy_threshold} · ${form.mode} · K线订阅 ${scan.ws?.candleSubs ?? 0}`
+                  ? `WebSocket 推送中 · RSI < ${activeRsiThreshold} · ${form.mode} · K线订阅 ${scan.ws?.candleSubs ?? 0}`
                   : '选择 mode → 设置成交量/数量上限 → 点击「开始全市场扫描」（REST 预热 + WS 推送）')}
             </div>
             {scan.lastScanAt && (
@@ -1007,19 +1330,135 @@ export default function App() {
           </section>
         </div>
 
-        <section className="card params-card">
-          <h2>
-            <span className="dot" />
-            扫描参数
-          </h2>
-          <div className="form-grid">
-            <div className="field">
-              <label>交易模式 mode</label>
-              <select value={form.mode} onChange={(e) => setField('mode', e.target.value as Mode)}>
-                <option value="spot">spot · USDT 现货</option>
-                <option value="swap">swap · USDT 永续</option>
-              </select>
+        {settingsOpen && <button className="settings-backdrop" aria-label="关闭策略设置" onClick={() => setSettingsOpen(false)} />}
+        <section className={`card params-card settings-drawer ${settingsOpen ? 'open' : ''}`} role="dialog" aria-modal="true" aria-label="策略设置">
+          <div className="settings-head">
+            <div>
+              <div className="eyebrow">STRATEGY CONTROL</div>
+              <h2>
+                <span className="dot" />
+                策略设置
+              </h2>
             </div>
+            <button type="button" className="icon-btn" aria-label="关闭策略设置" onClick={() => setSettingsOpen(false)} autoFocus>×</button>
+          </div>
+          {settingsDirty && (
+            <div className="settings-save-status dirty">
+              <span className="save-status-dot" />
+              <div>
+                <strong>有未保存的修改</strong>
+                <span>{running ? '保存后会在下次启动扫描时生效' : '保存后刷新页面仍会保留'}</span>
+              </div>
+            </div>
+          )}
+          <div className="market-mode-tabs" role="tablist" aria-label="交易市场">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={form.mode === 'spot'}
+              className={form.mode === 'spot' ? 'active' : ''}
+              onClick={() => setField('mode', 'spot')}
+            >
+              <span className="mode-tab-icon">●</span>
+              <span>现货<small>SPOT · USDT</small></span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={form.mode === 'swap'}
+              className={form.mode === 'swap' ? 'active' : ''}
+              onClick={() => setField('mode', 'swap')}
+            >
+              <span className="mode-tab-icon">↗</span>
+              <span>合约<small>SWAP · USDT 永续</small></span>
+            </button>
+          </div>
+          <div className="strategy-card">
+            <div className="strategy-card-body">
+              <div className="strategy-card-title">
+                <span className="strategy-chip">当前策略</span>
+                <strong>{activeStrategy.name}</strong>
+              </div>
+              <div className="strategy-card-summary mono">{activeStrategy.summary(form)}</div>
+              <div className="strategy-card-tags">
+                {activeStrategy.tags.map((t) => (
+                  <i key={t}>{t}</i>
+                ))}
+              </div>
+            </div>
+            <button type="button" className="btn btn-ghost" onClick={() => setStrategyPickerOpen(true)}>
+              切换策略
+            </button>
+          </div>
+
+          <div className="settings-tabs" role="tablist" aria-label="设置分区">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={settingsTab === 'strategy'}
+              className={settingsTab === 'strategy' ? 'active' : ''}
+              onClick={() => setSettingsTab('strategy')}
+            >
+              策略参数<span>{activeStrategy.fields.length}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={settingsTab === 'shared'}
+              className={settingsTab === 'shared' ? 'active' : ''}
+              onClick={() => setSettingsTab('shared')}
+            >
+              通用设置<span>{form.mode === 'swap' ? 14 : 12}</span>
+            </button>
+          </div>
+
+          {settingsTab === 'strategy' && (
+            <div key={activeStrategy.id} className="settings-mode-panel">
+              <div className="preset-row">
+                <div className="preset-label">
+                  <strong>快速预设</strong>
+                  <span>{activeStrategy.presets.find((p) => p.id === activePreset)?.desc || '已手动调整参数'}</span>
+                </div>
+                <div className="preset-chips">
+                  {activeStrategy.presets.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      title={p.desc}
+                      className={activePreset === p.id ? 'active' : ''}
+                      onClick={() => applyPatch(p.values)}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                  <span className={`preset-custom ${activePreset ? '' : 'active'}`}>自定义</span>
+                </div>
+              </div>
+              <div className="form-grid">
+                {activeStrategy.fields.filter((f) => !f.advanced).map(renderStrategyField)}
+              </div>
+              {activeStrategy.fields.some((f) => f.advanced) && (
+                <details className="settings-advanced">
+                  <summary>
+                    高级参数<span>{activeStrategy.fields.filter((f) => f.advanced).length}</span>
+                  </summary>
+                  <div className="form-grid">
+                    {activeStrategy.fields.filter((f) => f.advanced).map(renderStrategyField)}
+                  </div>
+                </details>
+              )}
+            </div>
+          )}
+
+          <div key={form.mode} className="settings-mode-panel" hidden={settingsTab !== 'shared'}>
+            <details className="settings-group" open>
+              <summary>执行与账户{form.mode === 'swap' && <span>2</span>}</summary>
+              <div className="settings-facts">
+                {form.mode === 'swap'
+                  ? ['全仓 cross', '多头 long', '下单单位 USDT'].map((t) => <span key={t}>{t}</span>)
+                  : ['结算 USDT', '现货买入', '无杠杆', '本地模拟执行'].map((t) => <span key={t}>{t}</span>)}
+              </div>
+              <div className="form-grid">
             {form.mode === 'swap' && (
               <>
                 <div className="field">
@@ -1035,18 +1474,6 @@ export default function App() {
                     ))}
                   </select>
                   <div className="hint">1–20 倍；盈亏按 金额×杠杆×涨跌% 估算</div>
-                </div>
-                <div className="field">
-                  <label>保证金模式</label>
-                  <input value="全仓 cross" disabled readOnly />
-                </div>
-                <div className="field">
-                  <label>仓位方向</label>
-                  <input value="多头 long" disabled readOnly />
-                </div>
-                <div className="field">
-                  <label>下单单位</label>
-                  <input value="USDT" disabled readOnly />
                 </div>
                 <div className="field">
                   <label>执行方式</label>
@@ -1126,46 +1553,13 @@ export default function App() {
                 )}
               </>
             )}
-            <div className="field">
-              <label>K线周期 bar</label>
-              <select value={form.bar} onChange={(e) => setField('bar', e.target.value as Bar)}>
-                {(['1m', '5m', '15m', '1H', '4H', '1Dutc'] as Bar[]).map((b) => (
-                  <option key={b} value={b}>
-                    {b}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="field">
-              <label>RSI 周期</label>
-              <input
-                type="number"
-                min="2"
-                value={form.rsi_period}
-                onChange={(e) => setField('rsi_period', e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label>买入阈值（RSI &lt;）</label>
-              <input
-                type="number"
-                value={form.rsi_buy_threshold}
-                onChange={(e) => setField('rsi_buy_threshold', e.target.value)}
-              />
-              <div className="hint">按实时 RSI（含未收盘 K 线）判定；建议 25–35</div>
-            </div>
-            <div className="field">
-              <label>需收盘确认</label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={form.confirm_on_close}
-                  onChange={(e) => setField('confirm_on_close', e.target.checked)}
-                />
-                <span>需收盘确认</span>
-              </label>
-              <div className="hint">勾选后还要求最近已收盘 K 线 RSI 也低于阈值（默认不勾选）</div>
-            </div>
+              </div>
+            </details>
+            <details className="settings-group" open>
+              <summary>
+                资金与风控<span>7</span>
+              </summary>
+              <div className="form-grid">
             <div className="field">
               <label>{form.mode === 'swap' ? '每笔保证金 USDT' : '每笔金额 USDT'}</label>
               <input
@@ -1179,24 +1573,6 @@ export default function App() {
                   名义仓位约 {(Number(form.amount) || 0) * (Number(form.leverage) || 1)} USDT
                 </div>
               )}
-            </div>
-            <div className="field">
-              <label>止盈 %</label>
-              <input
-                type="number"
-                step="0.1"
-                value={form.take_profit_pct}
-                onChange={(e) => setField('take_profit_pct', e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label>止损 %</label>
-              <input
-                type="number"
-                step="0.1"
-                value={form.stop_loss_pct}
-                onChange={(e) => setField('stop_loss_pct', e.target.value)}
-              />
             </div>
             <div className="field">
               <label>最大持仓数</label>
@@ -1263,6 +1639,13 @@ export default function App() {
               />
               <div className="hint">(卖一−买一)/中间价 超过则跳过，默认 0.3%</div>
             </div>
+              </div>
+            </details>
+            <details className="settings-group">
+              <summary>
+                市场扫描<span>5</span>
+              </summary>
+              <div className="form-grid">
             <div className="field">
               <label>最小 24h 成交额 USDT</label>
               <input
@@ -1318,6 +1701,8 @@ export default function App() {
               />
               <div className="hint">不强制；会并入扫描列表</div>
             </div>
+              </div>
+            </details>
           </div>
 
           {isLiveExec && (
@@ -1342,16 +1727,15 @@ export default function App() {
           {modeHint && <div className="config-hint">🔄 {modeHint}</div>}
           {configHint && <div className="config-hint">💡 {configHint}</div>}
 
-          <div className="actions">
-            {!running ? (
-              <button className={`btn ${isLiveExec ? 'btn-danger' : 'btn-amber'}`} onClick={onStart} disabled={loading || liveModal.loading}>
-                {loading || liveModal.loading ? <span className="spinner" /> : '▶'} {isLiveExec ? '开始实盘扫描（真实资金）' : '开始全市场扫描'}
-              </button>
-            ) : (
-              <button className="btn btn-danger" onClick={onStop}>
-                ■ 停止扫描
-              </button>
-            )}
+          <div className="settings-run-card">
+            <div className="settings-run-head">
+              <div>
+                <strong>工具</strong>
+                <span>{running ? '扫描正在运行；保存的参数将在下次启动时应用。' : '用顶栏的「开始扫描」启动，启动前会自动保存设置。'}</span>
+              </div>
+              <span className={`run-state ${running ? 'online' : ''}`}>{running ? '运行中' : '未运行'}</span>
+            </div>
+            <div className="actions settings-run-actions">
             <button className="btn btn-primary" onClick={onPreviewUniverse} disabled={loading}>
               {loading ? <span className="spinner" /> : '◎'} 预览 Universe
             </button>
@@ -1360,24 +1744,135 @@ export default function App() {
                 清除本地模拟持仓
               </button>
             )}
-            <button className="btn btn-kill" onClick={() => onKill(false)} disabled={killBusy}>
-              ⛔ 急停
-            </button>
-            <button className="btn btn-kill" onClick={() => onKill(true)} disabled={killBusy}>
-              {killBusy ? <span className="spinner" /> : '⛔'} 急停并全部平仓
-            </button>
+            </div>
           </div>
+          <details className="danger-zone">
+            <summary>风险控制与急停</summary>
+            <p>急停会阻止新开仓；“急停并全部平仓”还会处理本程序管理的现有持仓。</p>
+            <div className="actions">
+              <button className="btn btn-danger" onClick={() => onKill(false)} disabled={killBusy}>
+                ⛔ 仅急停
+              </button>
+              <button className="btn btn-kill" onClick={() => onKill(true)} disabled={killBusy}>
+                {killBusy ? <span className="spinner" /> : '⛔'} 急停并全部平仓
+              </button>
+            </div>
+          </details>
           {error && <div className="error-toast">{error}</div>}
+          <div className="settings-footer">
+            <div className={`settings-footer-message ${settingsSaveState}`}>
+              {settingsSaveState === 'error'
+                ? '保存失败，请检查浏览器存储权限'
+                : settingsDirty
+                  ? '修改尚未保存'
+                  : settingsSaveState === 'saved'
+                    ? '设置已保存'
+                    : settingsSavedAt
+                      ? `上次保存 ${localTs(settingsSavedAt)}`
+                      : '当前使用默认设置'}
+            </div>
+            <div className="actions">
+              <button type="button" className="btn btn-ghost" onClick={restoreSavedSettings} disabled={!settingsDirty}>
+                放弃修改
+              </button>
+              <button type="button" className="btn btn-primary save-settings-btn" onClick={saveSettings} disabled={!settingsDirty}>
+                {settingsDirty ? '保存设置' : '✓ 已保存'}
+              </button>
+            </div>
+          </div>
         </section>
+
+        {strategyPickerOpen && (
+          <section className="strategy-picker" role="dialog" aria-modal="true" aria-label="选择策略">
+            <div className="strategy-picker-head">
+              <button type="button" className="icon-btn" aria-label="返回策略设置" onClick={() => setStrategyPickerOpen(false)} autoFocus>
+                ←
+              </button>
+              <div>
+                <strong>选择策略</strong>
+                <span>同时只运行一个策略{running ? '；切换后需重新开始扫描才生效' : ''}</span>
+              </div>
+            </div>
+            <div className="strategy-picker-list">
+              {STRATEGIES.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  className={`strategy-option ${s.id === form.strategy ? 'active' : ''}`}
+                  onClick={() => selectStrategy(s.id)}
+                >
+                  <span className="strategy-option-radio" aria-hidden="true" />
+                  <span className="strategy-option-body">
+                    <strong>{s.name}</strong>
+                    <span>{s.tagline}</span>
+                    <span className="strategy-option-tags">
+                      {s.tags.map((t) => (
+                        <i key={t}>{t}</i>
+                      ))}
+                    </span>
+                  </span>
+                  {s.id === form.strategy && <span className="strategy-option-current">使用中</span>}
+                </button>
+              ))}
+              <div className="strategy-picker-soon">更多策略开发中，敬请期待</div>
+            </div>
+          </section>
+        )}
       </div>
 
-      <section className="card table-card">
-        <h2>
-          <span className="dot" />
-          扫描结果
-          <span className="table-meta">{signals.length} 条 · 信号优先 / RSI 升序</span>
-        </h2>
-        <div className="table-wrap">
+      <section className="card table-card signals-card">
+        <div className="signals-head">
+          <h2>
+            <span className="dot" />
+            扫描结果
+            <span className="table-meta">
+              {visibleSignals.length === signals.length ? `${signals.length} 条` : `${visibleSignals.length} / ${signals.length} 条`}
+            </span>
+          </h2>
+          <div className="signals-legend">
+            <span><i className="legend-dot hot" />超卖 &lt; {activeRsiThreshold}</span>
+            <span><i className="legend-dot warm" />临界 &lt; {activeRsiThreshold + 8}</span>
+            {running && <span className="legend-note">按运行中的配置</span>}
+          </div>
+        </div>
+        <div className="signals-toolbar">
+          <label className="signal-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              value={signalQuery}
+              onChange={(e) => setSignalQuery(e.target.value)}
+              placeholder="搜索 BTC、ETH…"
+              aria-label="搜索交易对"
+            />
+            {signalQuery && (
+              <button type="button" onClick={() => setSignalQuery('')} aria-label="清空搜索">×</button>
+            )}
+          </label>
+          <div className="signal-filters" role="group" aria-label="筛选扫描结果">
+            <button type="button" className={signalFilter === 'all' ? 'active' : ''} onClick={() => setSignalFilter('all')}>
+              全部 <span>{signalCounts.all}</span>
+            </button>
+            <button type="button" className={signalFilter === 'triggered' ? 'active' : ''} onClick={() => setSignalFilter('triggered')}>
+              已触发 <span>{signalCounts.triggered}</span>
+            </button>
+            <button type="button" className={signalFilter === 'watchlist' ? 'active' : ''} onClick={() => setSignalFilter('watchlist')}>
+              自选 <span>{signalCounts.watchlist}</span>
+            </button>
+            <button type="button" className={signalFilter === 'skipped' ? 'active' : ''} onClick={() => setSignalFilter('skipped')}>
+              已过滤 <span>{signalCounts.skipped}</span>
+            </button>
+          </div>
+          <label className="signal-sort">
+            <span>排序</span>
+            <select value={signalSort} onChange={(e) => setSignalSort(e.target.value as SignalSort)}>
+              <option value="priority">信号优先</option>
+              <option value="rsi">RSI 从低到高</option>
+              <option value="volume">成交额从高到低</option>
+              <option value="updated">最近更新</option>
+            </select>
+          </label>
+        </div>
+        <div className="table-wrap signal-table-view">
           <table className="data-table">
             <thead>
               <tr>
@@ -1390,14 +1885,22 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {signals.length === 0 ? (
+              {visibleSignals.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="empty-cell">
-                    暂无数据 — 预览 Universe 或开始扫描
+                    <div className="signal-empty">
+                      <strong>{signals.length === 0 ? '尚未生成扫描结果' : '没有符合当前筛选的交易对'}</strong>
+                      <span>{signals.length === 0 ? '可以先预览市场，确认 Universe 范围。' : '尝试清空搜索或切换筛选条件。'}</span>
+                      {signals.length === 0 ? (
+                        <button type="button" className="btn btn-ghost" onClick={onPreviewUniverse} disabled={loading}>预览市场</button>
+                      ) : (
+                        <button type="button" className="btn btn-ghost" onClick={() => { setSignalQuery(''); setSignalFilter('all'); }}>重置筛选</button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ) : (
-                signals.map((s) => (
+                visibleSignals.map((s) => (
                   <tr
                     key={s.instId}
                     className={s.filtered || s.notOnDemo ? 'row-filtered' : s.skipped ? 'row-skipped' : s.signal ? 'row-signal' : ''}
@@ -1407,9 +1910,11 @@ export default function App() {
                       {s.watchlist ? <span className="tag">自选</span> : null}
                     </td>
                     <td className="mono">{fmtVol(s.volUsd24h)}</td>
-                    <td className="mono">${fmtPrice(s.price)}</td>
-                    <td className={`mono ${s.signal ? 'text-teal' : ''}`}>
-                      {fmtRsi(s.rsi)}
+                    <td>
+                      <FlashNum value={s.price} className="mono">${fmtPrice(s.price)}</FlashNum>
+                    </td>
+                    <td className="mono">
+                      <span className={`rsi-chip ${rsiTone(s.rsi, activeRsiThreshold)}`}>{fmtRsi(s.rsi)}</span>
                       {s.forming ? <span className="tag">实时</span> : null}
                       {s.forming && s.rsiClosed != null && s.rsiClosed > 0 ? (
                         <span className="table-meta"> 收盘 {s.rsiClosed.toFixed(2)}</span>
@@ -1434,21 +1939,90 @@ export default function App() {
                         <span className="pill">—</span>
                       )}
                     </td>
-                    <td className="mono dim">{s.at ? localTs(s.at) : '—'}</td>
+                    <td className="mono dim" title={s.at ? localTs(s.at) : ''}>{relativeTs(s.at)}</td>
                   </tr>
                 ))
               )}
             </tbody>
           </table>
         </div>
+        <div className="signal-cards">
+          {visibleSignals.length === 0 ? (
+            <div className="signal-empty mobile-empty">
+              <strong>{signals.length === 0 ? '尚未生成扫描结果' : '没有符合当前筛选的交易对'}</strong>
+              <span>{signals.length === 0 ? '预览市场或开始扫描后，信号会出现在这里。' : '可以重置搜索和筛选条件。'}</span>
+              {signals.length === 0 ? (
+                <button type="button" className="btn btn-ghost" onClick={onPreviewUniverse} disabled={loading}>预览市场</button>
+              ) : (
+                <button type="button" className="btn btn-ghost" onClick={() => { setSignalQuery(''); setSignalFilter('all'); }}>重置筛选</button>
+              )}
+            </div>
+          ) : (
+            visibleSignals.map((s) => {
+              const state = signalState(s);
+              return (
+                <article key={s.instId} className={`signal-card ${state.tone}`}>
+                  <div className="signal-card-head">
+                    <div>
+                      <strong className="mono">{s.instId}</strong>
+                      {s.watchlist ? <span className="tag">自选</span> : null}
+                    </div>
+                    <span className={`signal-state ${state.tone}`}>{state.label}</span>
+                  </div>
+                  <div className="signal-card-main">
+                    <div>
+                      <span className="signal-label">RSI</span>
+                      <strong className={`rsi-mobile ${rsiTone(s.rsi, activeRsiThreshold)}`}>{fmtRsi(s.rsi)}</strong>
+                      {s.forming ? <span className="tag">实时</span> : null}
+                    </div>
+                    <div>
+                      <span className="signal-label">现价</span>
+                      <strong className="mono">${fmtPrice(s.price)}</strong>
+                    </div>
+                    <div>
+                      <span className="signal-label">24h 成交额</span>
+                      <strong className="mono">{fmtVol(s.volUsd24h)}</strong>
+                    </div>
+                  </div>
+                  {(state.detail || (s.forming && s.rsiClosed != null && s.rsiClosed > 0)) && (
+                    <div className="signal-card-detail">
+                      {state.detail || `收盘 RSI ${s.rsiClosed?.toFixed(2)}`}
+                    </div>
+                  )}
+                  <div className="signal-card-foot">
+                    <span>{s.forming ? '实时 K 线' : '已收盘 K 线'}</span>
+                    <time title={s.at ? localTs(s.at) : ''}>{relativeTs(s.at)}</time>
+                  </div>
+                </article>
+              );
+            })
+          )}
+        </div>
       </section>
 
-      <section className="card table-card">
+      <section className="lower-workspace" aria-label="交易与运行详情">
+        <nav className="lower-tabs" aria-label="详情分类">
+          <button type="button" className={lowerTab === 'positions' ? 'active' : ''} onClick={() => setLowerTab('positions')}>
+            <span>持仓</span><b>{positions.length}</b>
+          </button>
+          <button type="button" className={lowerTab === 'history' ? 'active' : ''} onClick={() => setLowerTab('history')}>
+            <span>平仓记录</span><b>{pnl?.closed_trades ?? 0}</b>
+          </button>
+          <button type="button" className={lowerTab === 'filtered' ? 'active' : ''} onClick={() => setLowerTab('filtered')}>
+            <span>止损过滤</span><b>{filtered.length}</b>
+          </button>
+          <button type="button" className={lowerTab === 'logs' ? 'active' : ''} onClick={() => setLowerTab('logs')}>
+            <span>事件日志</span><b>{logs.length}</b>
+          </button>
+        </nav>
+        <div className="lower-panel">
+        {lowerTab === 'positions' && (
+      <section className="card table-card positions-card">
         <h2>
           <span className="dot" />
           持仓
           <span className="table-meta">
-            {positions.length} / {form.max_positions}
+            {positions.length} / {activeMaxPositions}
             {exec?.risk?.pending_opens?.length ? ` · 下单中 ${exec.risk.pending_opens.join(', ')}` : ''}
           </span>
         </h2>
@@ -1457,35 +2031,30 @@ export default function App() {
             <thead>
               <tr>
                 <th>交易对</th>
-                <th>来源</th>
-                <th>张数</th>
-                <th>杠杆</th>
-                <th>成交均价</th>
-                <th>现价</th>
-                <th>浮盈%</th>
-                <th>浮盈 USDT</th>
-                <th>止盈价</th>
-                <th>止损价</th>
-                <th>交易所止盈止损</th>
+                <th>均价 → 现价</th>
+                <th>浮动盈亏</th>
+                <th>止盈 / 止损</th>
+                {hasExchangePos && <th>交易所止盈止损</th>}
                 <th>状态</th>
+                <th className="col-action">操作</th>
               </tr>
             </thead>
             <tbody>
               {positions.length === 0 ? (
                 <tr>
-                  <td colSpan={12} className="empty-cell">
-                    暂无持仓 — 信号触发且未满仓时将{isLiveExec ? '在 OKX 实盘下单（真实资金）' : isDemoExec ? '在 OKX 模拟盘下单' : '模拟买入'}
+                  <td colSpan={hasExchangePos ? 7 : 6} className="empty-cell">
+                    <div className="compact-empty">
+                      <span className="empty-icon">◇</span>
+                      <strong>暂无持仓</strong>
+                      <span>信号触发且未满仓时将{isLiveExec ? '在 OKX 实盘下单（真实资金）' : isDemoExec ? '在 OKX 模拟盘下单' : '模拟买入'}。</span>
+                    </div>
                   </td>
                 </tr>
               ) : (
                 positions.map((p) => {
                   const isDemo = isExchangeMode(p.exec_mode);
-                  const tp =
-                    p.take_profit_price ??
-                    p.entry_price * (1 + Number(form.take_profit_pct) / 100);
-                  const sl =
-                    p.stop_loss_price ??
-                    p.entry_price * (1 - Number(form.stop_loss_pct) / 100);
+                  const tp = p.take_profit_price ?? exitPrice(p.entry_price, p.take_profit_pct, 1);
+                  const sl = p.stop_loss_price ?? exitPrice(p.entry_price, p.stop_loss_pct, -1);
                   const pct = p.profit_pct;
                   const lev = p.leverage || 1;
                   const uplUsdt =
@@ -1496,28 +2065,44 @@ export default function App() {
                         : null;
                   return (
                     <tr key={p.instId}>
-                      <td className="mono">{p.instId}</td>
                       <td>
-                        <span className={`tag ${p.exec_mode === 'okx_live' ? 'tag-live' : ''}`}>{EXEC_TEXT[p.exec_mode || 'sim'] || '本地模拟'}</span>
+                        <div className="cell-stack">
+                          <span className="mono">{p.instId}</span>
+                          <span className="cell-sub">
+                            {p.mode === 'swap' || lev > 1 ? `${lev}x · ` : ''}
+                            {p.amount} USDT
+                            {isDemo ? ` · ${p.contractsStr ?? p.contracts ?? '—'} 张` : ''}
+                            {isDemo && p.exchange_contracts != null && p.contracts != null && p.exchange_contracts !== p.contracts
+                              ? `（所 ${p.exchange_contracts}）`
+                              : ''}
+                            {hasExchangePos ? ` · ${EXEC_TEXT[p.exec_mode || 'sim'] || '本地模拟'}` : ''}
+                          </span>
+                        </div>
                       </td>
-                      <td className="mono">
-                        {isDemo ? p.contractsStr ?? p.contracts ?? '—' : '—'}
-                        {isDemo && p.exchange_contracts != null && p.contracts != null && p.exchange_contracts !== p.contracts ? (
-                          <span className="table-meta"> (所 {p.exchange_contracts})</span>
-                        ) : null}
+                      <td>
+                        <div className="cell-stack">
+                          <FlashNum value={p.last_price} className="mono">${fmtPrice(p.last_price)}</FlashNum>
+                          <span className="cell-sub mono">开仓 ${fmtPrice(p.entry_price)}</span>
+                        </div>
                       </td>
-                      <td className="mono">{p.mode === 'swap' || lev > 1 ? `${lev}x` : '—'}</td>
-                      <td className="mono">${fmtPrice(p.entry_price)}</td>
-                      <td className="mono">${fmtPrice(p.last_price)}</td>
-                      <td className={`mono ${pnlClass(pct)}`}>
-                        {pct == null ? '—' : `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`}
+                      <td>
+                        <div className="cell-stack">
+                          <FlashNum value={pct} className={`mono ${pnlClass(pct)}`}>
+                            {pct == null ? '—' : `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`}
+                          </FlashNum>
+                          <span className={`cell-sub mono ${pnlClass(uplUsdt)}`}>
+                            {fmtUsdt(uplUsdt)} USDT
+                            {isDemo && p.upl == null ? ' · 估算' : ''}
+                          </span>
+                        </div>
                       </td>
-                      <td className={`mono ${pnlClass(uplUsdt)}`}>
-                        {fmtUsdt(uplUsdt)}
-                        {isDemo && p.upl == null ? <span className="tag">估</span> : null}
+                      <td>
+                        <div className="cell-stack">
+                          <span className="mono text-green">{tp == null ? '—' : `$${fmtPrice(tp)}`}</span>
+                          <span className="cell-sub mono text-rose">{sl == null ? '—' : `$${fmtPrice(sl)}`}</span>
+                        </div>
                       </td>
-                      <td className="mono text-green">${fmtPrice(tp)}</td>
-                      <td className="mono text-rose">${fmtPrice(sl)}</td>
+                      {hasExchangePos && (
                       <td>
                         {!isDemo ? (
                           <span className="pill">本地监控</span>
@@ -1531,6 +2116,7 @@ export default function App() {
                           <span className="pill text-rose">❌ 未挂</span>
                         )}
                       </td>
+                      )}
                       <td>
                         <span className={`pill ${p.status === 'open' ? 'on' : ''}`}>
                           {p.status === 'closing'
@@ -1539,6 +2125,16 @@ export default function App() {
                               ? '持仓中'
                               : p.status || 'open'}
                         </span>
+                      </td>
+                      <td className="col-action">
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => setCloseModal({ pos: p, busy: false, error: null })}
+                          disabled={p.status === 'closing'}
+                        >
+                          平仓
+                        </button>
                       </td>
                     </tr>
                   );
@@ -1585,8 +2181,76 @@ export default function App() {
           </div>
         )}
       </section>
+        )}
 
-      <section className="card">
+        {lowerTab === 'history' && (
+          <section className="card table-card history-card">
+            <div className="card-head lower-card-head">
+              <h2><span className="dot" />平仓记录</h2>
+              <span className="table-meta">当前显示：{viewModeText} · {pnl?.closed_trades ?? 0} 笔</span>
+            </div>
+            <div className="table-wrap">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>交易对</th>
+                    <th>平仓原因</th>
+                    <th>入场 → 出场</th>
+                    <th>金额</th>
+                    <th>盈亏</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!pnl?.recent?.length ? (
+                    <tr>
+                      <td colSpan={6} className="empty-cell">
+                        <div className="compact-empty">
+                          <span className="empty-icon">⇄</span>
+                          <strong>暂无平仓记录</strong>
+                          <span>持仓触发止盈、止损或手动平仓后会显示在这里。</span>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : (
+                    pnl.recent.map((t) => (
+                      <tr key={t.id || `${t.instId}-${t.closed_at}`}>
+                        <td className="mono dim">{t.closed_at ? localTs(t.closed_at) : '—'}</td>
+                        <td>
+                          <div className="cell-stack">
+                            <span className="mono">{t.instId}</span>
+                            <span className="cell-sub">
+                              {EXEC_TEXT[t.exec_mode || 'sim'] || '本地模拟'}
+                              {t.leverage && t.leverage > 1 ? ` · ${t.leverage}x` : ''}
+                            </span>
+                          </div>
+                        </td>
+                        <td><span className={`pill ${t.action === 'tp' ? 'on' : ''}`}>{ACTION_TEXT[t.action] || t.action}</span></td>
+                        <td className="mono">${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}</td>
+                        <td className="mono">{fmtPrice(t.amount)}</td>
+                        <td>
+                          <div className="cell-stack">
+                            <span className={`mono ${pnlClass(t.pnl_usdt)}`}>
+                              {fmtUsdt(t.pnl_usdt)} USDT
+                              {isExchangeMode(t.exec_mode) && !t.pnl_exact ? <span className="tag">估算</span> : null}
+                            </span>
+                            <span className={`cell-sub mono ${pnlClass(t.profit_pct)}`}>
+                              {t.profit_pct == null ? '—' : `${t.profit_pct >= 0 ? '+' : ''}${t.profit_pct.toFixed(2)}%`}
+                              {t.fee_usdt == null ? '' : ` · 手续费 ${t.fee_usdt.toFixed(4)}`}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {lowerTab === 'filtered' && (
+      <section className="card filters-card">
         <div className="card-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h2 style={{ margin: 0 }}>连续止损过滤</h2>
           <span className="table-meta">{filtered.length} 个币暂停开仓</span>
@@ -1606,7 +2270,11 @@ export default function App() {
               {filtered.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="empty-cell">
-                    暂无。同一币连续止损达到阈值后会出现在这里。
+                    <div className="compact-empty">
+                      <span className="empty-icon">◎</span>
+                      <strong>暂无风控过滤</strong>
+                      <span>同一交易对连续止损达到阈值后会显示在这里。</span>
+                    </div>
                   </td>
                 </tr>
               ) : (
@@ -1642,7 +2310,9 @@ export default function App() {
           </table>
         </div>
       </section>
+        )}
 
+        {lowerTab === 'logs' && (
       <section className="card logs-card">
         <div className="log-toolbar">
           <h2 style={{ margin: 0 }}>
@@ -1655,7 +2325,11 @@ export default function App() {
         </div>
         <div className="log-list">
           {logs.length === 0 ? (
-            <div className="empty-log">暂无事件 — 开始扫描后将在此显示</div>
+            <div className="empty-log compact-empty">
+              <span className="empty-icon">≡</span>
+              <strong>暂无事件</strong>
+              <span>开始扫描后，连接、信号和交易事件会显示在这里。</span>
+            </div>
           ) : (
             logs.map((l, i) => (
               <div className="log-item" key={`${l.ts}-${i}`}>
@@ -1667,6 +2341,77 @@ export default function App() {
           )}
         </div>
       </section>
+        )}
+        </div>
+      </section>
+
+      {closeModal.pos && (() => {
+        const p = closeModal.pos;
+        const isExch = isExchangeMode(p.exec_mode);
+        const lev = p.leverage || 1;
+        const uplUsdt = p.upl != null ? p.upl : p.profit_pct != null ? (p.amount * lev * p.profit_pct) / 100 : null;
+        return (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="确认平仓">
+            <div className="modal close-modal">
+              <h2>{p.exec_mode === 'okx_live' ? '⚠️ 实盘市价平仓（真实资金）' : '确认平仓'}</h2>
+              <table className="data-table modal-table">
+                <tbody>
+                  <tr>
+                    <td>交易对</td>
+                    <td className="mono">{p.instId}</td>
+                  </tr>
+                  <tr>
+                    <td>执行方式</td>
+                    <td>
+                      <span className={`tag ${p.exec_mode === 'okx_live' ? 'tag-live' : ''}`}>
+                        {EXEC_TEXT[p.exec_mode || 'sim'] || '本地模拟'}
+                      </span>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>开仓价 → 现价</td>
+                    <td className="mono">
+                      ${fmtPrice(p.entry_price)} → ${fmtPrice(p.last_price)}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>预估实现盈亏</td>
+                    <td className={`mono ${pnlClass(uplUsdt)}`}>
+                      {p.profit_pct == null ? '—' : `${p.profit_pct >= 0 ? '+' : ''}${p.profit_pct.toFixed(2)}%`}
+                      {' · '}
+                      {fmtUsdt(uplUsdt)} USDT
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div className={isExch ? 'live-warn' : 'config-hint'}>
+                {isExch
+                  ? `将撤销该仓位在交易所的止盈止损委托，并按交易所持仓张数市价全平。${p.exec_mode === 'okx_live' ? '这会动用真实资金，盈亏立即实现。' : ''}实际成交价可能与现价有偏差。`
+                  : '按当前现价记账平仓，并写入平仓记录（平仓原因记为「手动」）。'}
+              </div>
+              {closeModal.error && <div className="error-toast">{closeModal.error}</div>}
+              <div className="actions modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => setCloseModal({ pos: null, busy: false, error: null })}
+                  disabled={closeModal.busy}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${p.exec_mode === 'okx_live' ? 'btn-kill' : 'btn-danger'}`}
+                  onClick={onClosePosition}
+                  disabled={closeModal.busy}
+                >
+                  {closeModal.busy ? <span className="spinner" /> : null} 确认平仓
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {liveModal.open && (
         <div className="modal-backdrop" role="dialog" aria-modal="true">

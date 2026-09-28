@@ -1165,6 +1165,9 @@ function openSimPosition(signalRow, cfg) {
     order_ccy: 'USDT',
     take_profit_price: tp,
     stop_loss_price: sl,
+    // 开仓时的止盈止损百分比快照：之后改设置不会追溯影响已有持仓
+    take_profit_pct: cfg.take_profit_pct,
+    stop_loss_pct: cfg.stop_loss_pct,
     rsi_at_entry: signalRow.rsi,
     rsi_closed_at_entry: signalRow.rsiClosed ?? null,
     at: new Date().toISOString(),
@@ -1189,12 +1192,23 @@ function openSimPosition(signalRow, cfg) {
   return pos;
 }
 
+/** 持仓的止盈止损百分比：优先用开仓时的快照，老数据回落到当前配置 */
+function exitPctOf(pos, cfg) {
+  const tp = Number(pos.take_profit_pct);
+  const sl = Number(pos.stop_loss_pct);
+  return {
+    tp: Number.isFinite(tp) && tp > 0 ? tp : Number(cfg.take_profit_pct),
+    sl: Number.isFinite(sl) && sl > 0 ? sl : Number(cfg.stop_loss_pct),
+  };
+}
+
 function checkExit(pos, price, cfg) {
   if (price == null || !Number.isFinite(price)) return null;
   // OKX 模拟盘/实盘持仓由交易所端 OCO 止盈止损负责平仓，本地绝不自行平仓
   if (isExchangeMode(pos.exec_mode)) return null;
+  const { tp: tpPct, sl: slPct } = exitPctOf(pos, cfg);
   const profitPct = ((price - pos.entry_price) / pos.entry_price) * 100;
-  if (profitPct >= cfg.take_profit_pct) {
+  if (profitPct >= tpPct) {
     const trade = recordClose(pos, price, 'tp', profitPct);
     pushLog(
       'tp',
@@ -1205,7 +1219,7 @@ function checkExit(pos, price, cfg) {
     onTakeProfit(pos.instId);
     return { action: 'tp', profitPct, pnl_usdt: trade.pnl_usdt };
   }
-  if (profitPct <= -cfg.stop_loss_pct) {
+  if (profitPct <= -slPct) {
     const trade = recordClose(pos, price, 'sl', profitPct);
     pushLog(
       'sl',
@@ -1344,8 +1358,8 @@ function evaluateSignals({ quiet = false } = {}) {
     if (price != null) {
       pos.last_price = price;
       pos.profit_pct = ((price - pos.entry_price) / pos.entry_price) * 100;
-      pos.take_profit_price = pos.entry_price * (1 + cfg.take_profit_pct / 100);
-      pos.stop_loss_price = pos.entry_price * (1 - cfg.stop_loss_pct / 100);
+      pos.take_profit_price = pos.entry_price * (1 + exitPctOf(pos, cfg).tp / 100);
+      pos.stop_loss_price = pos.entry_price * (1 - exitPctOf(pos, cfg).sl / 100);
       checkExit(pos, price, cfg);
     }
   }
@@ -2132,10 +2146,8 @@ app.get('/api/positions', (_req, res) => {
       ...p,
       last_price: price,
       profit_pct: profitPct,
-      take_profit_price:
-        isExchangeMode(p.exec_mode) ? p.take_profit_price : p.entry_price * (1 + Number(cfg.take_profit_pct) / 100),
-      stop_loss_price:
-        isExchangeMode(p.exec_mode) ? p.stop_loss_price : p.entry_price * (1 - Number(cfg.stop_loss_pct) / 100),
+      take_profit_price: p.take_profit_price ?? p.entry_price * (1 + exitPctOf(p, cfg).tp / 100),
+      stop_loss_price: p.stop_loss_price ?? p.entry_price * (1 - exitPctOf(p, cfg).sl / 100),
     };
   });
   res.json({
@@ -2184,6 +2196,48 @@ app.post('/api/position/clear', (req, res) => {
       monitor.positionsCount = 0;
     }
     pushLog('info', `已清除全部本地模拟持仓${kept ? `（保留 OKX 模拟盘/实盘持仓 ${kept} 个，以交易所为准）` : ''}`);
+  }
+  saveState();
+  res.json({ ok: true, positions: [...positions.values()] });
+});
+
+/** 手动平掉单个持仓：本地模拟按现价记账平仓；交易所持仓撤 OCO 后市价平仓并触发对账 */
+app.post('/api/position/close', async (req, res) => {
+  const raw = String(req.body?.instId || '').trim().toUpperCase();
+  if (!raw) return res.status(400).json({ error: 'instId 必填' });
+  // 前端传的就是持仓里的 instId，先原样查；扫描停止时 scanState 为空，归一化会误删 -SWAP 后缀
+  const instId = positions.has(raw)
+    ? raw
+    : normalizeInstId(raw, scanState?.config?.mode || (raw.endsWith('-SWAP') ? 'swap' : 'spot'));
+  const pos = positions.get(instId);
+  if (!pos) return res.status(404).json({ error: `${instId} 不在持仓中（可能已平仓）` });
+  if (pos.status === 'closing') {
+    return res.json({ ok: true, note: `${instId} 已在平仓中`, positions: [...positions.values()] });
+  }
+
+  if (isExchangeMode(pos.exec_mode)) {
+    const ex = execFor(pos.exec_mode);
+    try {
+      pos.close_reason = 'manual';
+      if (pos.algoId) await ex.cancelProtection(pos);
+      await ex.marketClose(pos, 'manual'); // 内部按交易所持仓张数全平
+      pushLog('sell', `[手动平仓] ${ex.envText} ${instId} 已提交市价平仓，等待对账确认`);
+      setTimeout(() => reconcileExchange(pos.exec_mode).catch(() => {}), 2500);
+    } catch (e) {
+      pos.close_reason = null;
+      pushLog('error', `[手动平仓] ${ex.envText} ${instId} 平仓失败：${e.message}`);
+      return res.status(502).json({ error: e.message });
+    }
+  } else {
+    const price =
+      Number(candleStore.get(instId)?.price) || Number(pos.last_price) || Number(pos.entry_price);
+    const pct = ((price - pos.entry_price) / pos.entry_price) * 100;
+    const trade = recordClose(pos, price, 'manual', pct);
+    positions.delete(instId);
+    pushLog(
+      'sell',
+      `[手动平仓·本地模拟] ${instId} @ ${price} | ${pct.toFixed(2)}% | 约 ${trade.pnl_usdt.toFixed(2)} USDT`
+    );
   }
   saveState();
   res.json({ ok: true, positions: [...positions.values()] });
