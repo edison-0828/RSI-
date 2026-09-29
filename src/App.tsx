@@ -602,6 +602,141 @@ function FlashNum({
   return <span className={`flash ${dir} ${className}`.trim()}>{children}</span>;
 }
 
+const FOCUSABLE_SELECTOR =
+  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+/**
+ * 记录弹窗之外的最后一个焦点元素。
+ * 不能在弹窗打开后现取 document.activeElement：autoFocus 在 effect 之前就把焦点移进弹窗了。
+ */
+let lastFocusOutsideDialog: HTMLElement | null = null;
+let focusTrackerReady = false;
+function ensureFocusTracker() {
+  if (focusTrackerReady || typeof document === 'undefined') return;
+  focusTrackerReady = true;
+  document.addEventListener(
+    'focusin',
+    (event) => {
+      const el = event.target as HTMLElement | null;
+      if (!el?.closest || el.closest('[role="dialog"]')) return;
+      lastFocusOutsideDialog = el;
+    },
+    true
+  );
+}
+
+/**
+ * 弹窗通用键盘行为：Escape 关闭 + Tab 焦点锁在弹窗内 + 关闭后把焦点还给触发元素。
+ * 平仓/急停这类破坏性操作如果焦点能跑到背景页面上，回车可能命中意料之外的按钮。
+ */
+function useDialogA11y<T extends HTMLElement = HTMLDivElement>(open: boolean, onClose: () => void) {
+  const ref = useRef<T>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  ensureFocusTracker();
+
+  useEffect(() => {
+    if (!open) return;
+    const current = document.activeElement as HTMLElement | null;
+    const restoreTo =
+      lastFocusOutsideDialog || (current && !current.closest('[role="dialog"]') ? current : null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const node = ref.current;
+      if (!node) return;
+      const items = Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetWidth > 0 || el.offsetHeight > 0
+      );
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (event.shiftKey && (active === first || !node.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !node.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      // 只在焦点确实丢了（弹窗真被卸载）时才归还。
+      // 焦点还在某个弹窗里说明这是 StrictMode 的模拟清理，或者焦点已经转给了上层弹窗，都不该抢。
+      const active = document.activeElement as HTMLElement | null;
+      const focusLost = !active || active === document.body;
+      if (focusLost && restoreTo && document.contains(restoreTo)) restoreTo.focus();
+    };
+  }, [open]);
+
+  return ref;
+}
+
+type ConfirmRequest = {
+  title: string;
+  body: React.ReactNode;
+  confirmText?: string;
+  tone?: 'danger' | 'default';
+};
+
+function ConfirmDialog({
+  request,
+  onSettle,
+}: {
+  request: ConfirmRequest;
+  onSettle: (ok: boolean) => void;
+}) {
+  const ref = useDialogA11y(true, () => onSettle(false));
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={request.title}>
+      <div className="modal confirm-modal" ref={ref}>
+        <h2>{request.title}</h2>
+        <div className="confirm-body">{request.body}</div>
+        <div className="actions modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={() => onSettle(false)}>
+            取消
+          </button>
+          <button
+            type="button"
+            className={`btn ${request.tone === 'danger' ? 'btn-danger' : 'btn-primary'}`}
+            onClick={() => onSettle(true)}
+            autoFocus
+          >
+            {request.confirmText || '确认'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 用 canvas 画一个纯色圆点当 favicon：切到别的标签页时靠颜色就能判断运行状态 */
+function paintFavicon(color: string) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(32, 32, 28, 0, Math.PI * 2);
+  ctx.fill();
+  let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+  if (!link) {
+    link = document.createElement('link');
+    link.rel = 'icon';
+    document.head.appendChild(link);
+  }
+  link.href = canvas.toDataURL('image/png');
+}
+
 export default function App() {
   const [initialSettings] = useState<StoredSettings>(() => loadSavedSettings());
   const [form, setForm] = useState<FormState>(initialSettings.form);
@@ -647,7 +782,28 @@ export default function App() {
     starting: false,
   });
   const prevMode = useRef(form.mode);
+  /** 轮询连续失败次数 + 最后一次成功时间：用来判断后端是不是已经不在了 */
+  const [conn, setConn] = useState<{ fails: number; lastOkAt: number | null }>({ fails: 0, lastOkAt: null });
+  const [nowTs, setNowTs] = useState(() => Date.now());
+  const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null);
+  const confirmResolve = useRef<((ok: boolean) => void) | null>(null);
   const settingsDirty = useMemo(() => JSON.stringify(form) !== JSON.stringify(savedForm), [form, savedForm]);
+
+  /** 替代原生 confirm()：原生弹窗会阻塞主线程，轮询和高亮动画在用户犹豫期间会整个停住 */
+  const askConfirm = useCallback((request: ConfirmRequest) => {
+    confirmResolve.current?.(false);
+    setConfirmReq(request);
+    return new Promise<boolean>((resolve) => {
+      confirmResolve.current = resolve;
+    });
+  }, []);
+
+  const settleConfirm = useCallback((ok: boolean) => {
+    setConfirmReq(null);
+    const resolve = confirmResolve.current;
+    confirmResolve.current = null;
+    resolve?.(ok);
+  }, []);
 
   const setField = <K extends keyof FormState>(key: K, value: FormState[K]) => {
     setForm((f) => ({ ...f, [key]: value }));
@@ -761,18 +917,25 @@ export default function App() {
   useEffect(() => {
     if (!settingsOpen) return;
     const previousOverflow = document.body.style.overflow;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      if (strategyPickerOpen) setStrategyPickerOpen(false);
-      else setSettingsOpen(false);
-    };
     document.body.style.overflow = 'hidden';
-    window.addEventListener('keydown', onKeyDown);
     return () => {
       document.body.style.overflow = previousOverflow;
-      window.removeEventListener('keydown', onKeyDown);
     };
-  }, [settingsOpen, strategyPickerOpen]);
+  }, [settingsOpen]);
+
+  // 策略选择器盖在设置抽屉之上，同一时刻只让最上层那个接管键盘
+  const settingsDrawerRef = useDialogA11y<HTMLElement>(settingsOpen && !strategyPickerOpen, () =>
+    setSettingsOpen(false)
+  );
+  const strategyPickerRef = useDialogA11y<HTMLElement>(strategyPickerOpen, () => setStrategyPickerOpen(false));
+  const closeDialogRef = useDialogA11y(!!closeModal.pos, () => {
+    if (!closeModal.busy) setCloseModal({ pos: null, busy: false, error: null });
+  });
+  const liveDialogRef = useDialogA11y(liveModal.open, () => {
+    if (!liveModal.starting) {
+      setLiveModal({ open: false, loading: false, check: null, text: '', error: null, starting: false });
+    }
+  });
 
   const payload = useMemo(() => {
     const watchlist = form.watchlist
@@ -845,8 +1008,10 @@ export default function App() {
       setExternalPositions(data.externalPositions || []);
       if (data.exec?.account?.updatedAt) setAccount(data.exec.account);
       if (data.logs) setLogs(data.logs);
+      setConn({ fails: 0, lastOkAt: Date.now() });
     } catch {
-      /* ignore */
+      // 不能静默：后端挂掉时界面会冻结在最后一帧，看起来一切正常
+      setConn((c) => ({ fails: c.fails + 1, lastOkAt: c.lastOkAt }));
     }
   }, []);
 
@@ -865,11 +1030,61 @@ export default function App() {
   }, [refreshStatus]);
 
   useEffect(() => {
-    const t = setInterval(() => {
+    // 后台标签页降到 30 秒，切回前台立刻补一次，省请求也省电
+    const period = () =>
+      document.visibilityState === 'hidden' ? 30000 : scan.running || scan.scanning ? 2500 : 8000;
+    let timer = window.setTimeout(function tick() {
       refreshStatus();
-    }, scan.running || scan.scanning ? 2500 : 8000);
-    return () => clearInterval(t);
+      timer = window.setTimeout(tick, period());
+    }, period());
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      window.clearTimeout(timer);
+      refreshStatus();
+      timer = window.setTimeout(function tick() {
+        refreshStatus();
+        timer = window.setTimeout(tick, period());
+      }, period());
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [scan.running, scan.scanning, refreshStatus]);
+
+  const offline = conn.fails >= 2;
+
+  useEffect(() => {
+    if (!offline) return;
+    setNowTs(Date.now());
+    const t = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [offline]);
+
+  const offlineSec = offline && conn.lastOkAt ? Math.max(0, Math.round((nowTs - conn.lastOkAt) / 1000)) : 0;
+
+  // 标签页标题和图标带上关键状态，切到别的窗口也能一眼看出要不要切回来
+  const totalPnl = pnl?.total_usdt;
+  useEffect(() => {
+    const head = offline
+      ? '⚠ 已失联'
+      : `${scan.running ? '扫描中 · ' : ''}${positions.length} 仓`;
+    const money =
+      totalPnl != null && Number.isFinite(totalPnl)
+        ? ` · ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}U`
+        : '';
+    document.title = `${head}${money} · RSI抄底宝`;
+    paintFavicon(
+      offline
+        ? '#f59e0b'
+        : totalPnl != null && totalPnl < 0
+          ? '#fb7185'
+          : scan.running
+            ? '#34d399'
+            : '#5d6d82'
+    );
+  }, [offline, scan.running, positions.length, totalPnl]);
 
   const testAccount = useCallback(async (mode: ExecMode = 'okx_demo') => {
     setAccountLoading(true);
@@ -1037,10 +1252,23 @@ export default function App() {
   };
 
   const onKill = async (closeAll: boolean) => {
-    const msg = closeAll
-      ? '确认【急停并全部平仓】？\n将停止扫描、禁止开新仓，并按交易所持仓数量市价平掉本程序管理的全部 OKX 模拟盘 / 实盘持仓（撤销其止盈止损），本地模拟持仓按现价平仓。\n（交易所上非本程序开的外部仓位不会被平掉）'
-      : '确认【急停】？\n将停止扫描并禁止开新仓；已有持仓保留（模拟盘/实盘持仓仍由交易所止盈止损保护）。';
-    if (!confirm(msg)) return;
+    const ok = await askConfirm({
+      title: closeAll ? '⚠️ 急停并全部平仓' : '急停',
+      tone: 'danger',
+      confirmText: closeAll ? '急停并全部平仓' : '确认急停',
+      body: closeAll ? (
+        <>
+          <p>将停止扫描、禁止开新仓，并按交易所持仓数量市价平掉本程序管理的全部 OKX 模拟盘 / 实盘持仓（撤销其止盈止损），本地模拟持仓按现价平仓。</p>
+          <p className="dim">交易所上非本程序开的外部仓位不会被平掉。</p>
+        </>
+      ) : (
+        <>
+          <p>将停止扫描并禁止开新仓。</p>
+          <p className="dim">已有持仓保留，模拟盘 / 实盘持仓仍由交易所止盈止损保护。</p>
+        </>
+      ),
+    });
+    if (!ok) return;
     setKillBusy(true);
     setError(null);
     try {
@@ -1059,7 +1287,12 @@ export default function App() {
   };
 
   const onKillReset = async () => {
-    if (!confirm('确认解除急停？解除后可重新开始扫描。')) return;
+    const ok = await askConfirm({
+      title: '解除急停',
+      confirmText: '解除急停',
+      body: <p>解除后可重新开始扫描。</p>,
+    });
+    if (!ok) return;
     try {
       await api('/api/kill/reset', { method: 'POST', body: '{}' });
       await refreshStatus();
@@ -1152,13 +1385,23 @@ export default function App() {
             <span className="badge mode">{form.mode === 'swap' ? '永续 SWAP' : '现货 Spot'}</span>
             {killOn && <span className="badge live">⛔ 急停中</span>}
             {running && (
-              <span className="badge running">
-                <span className="status-pulse" />
-                扫描中{scan.scanning ? '…' : ''} · R{scan.round || 0}
+              <span className={`badge ${offline ? 'stale' : 'running'}`}>
+                {!offline && <span className="status-pulse" />}
+                扫描中{scan.scanning && !offline ? '…' : ''} · R{scan.round || 0}
               </span>
             )}
-            <span className={`badge ${running && !scan.ws?.connected ? 'live' : 'mode'}`}>
-              WS：{!running ? '待机' : scan.ws?.connected ? '已连接' : scan.ws?.reconnecting ? '重连中' : '未连接'}
+            {/* 失联时这些状态全是过期数据，不能再显示成正常的绿色 */}
+            <span className={`badge ${offline ? 'stale' : running && !scan.ws?.connected ? 'live' : 'mode'}`}>
+              WS：
+              {offline
+                ? '未知'
+                : !running
+                  ? '待机'
+                  : scan.ws?.connected
+                    ? '已连接'
+                    : scan.ws?.reconnecting
+                      ? '重连中'
+                      : '未连接'}
             </span>
           </div>
           <div className="header-actions">
@@ -1174,18 +1417,37 @@ export default function App() {
               <button
                 className={`btn ${isLiveExec ? 'btn-danger' : 'btn-primary'}`}
                 onClick={() => { if (!settingsDirty || saveSettings()) onStart(); }}
-                disabled={loading || liveModal.loading}
+                disabled={loading || liveModal.loading || offline}
+                title={offline ? '后端已失联，无法下达指令' : undefined}
               >
                 {loading || liveModal.loading ? <span className="spinner" /> : '▶'} {isLiveExec ? '开始实盘' : '开始扫描'}
               </button>
             ) : (
-              <button className="btn btn-danger" onClick={onStop}>
+              <button
+                className="btn btn-danger"
+                onClick={onStop}
+                disabled={offline}
+                title={offline ? '后端已失联，无法下达指令' : undefined}
+              >
                 ■ 停止扫描
               </button>
             )}
           </div>
         </div>
       </header>
+
+      {offline && (
+        <div className="offline-banner" role="alert">
+          <div className="offline-banner-title">
+            <span className="offline-dot" />
+            后端已失联 {offlineSec > 0 ? `${offlineSec} 秒` : ''}
+          </div>
+          <div className="offline-banner-body">
+            下面显示的持仓、盈亏和扫描状态<b>全部是失联前的旧数据</b>，此刻不代表真实情况。
+            请确认 server 进程还在运行（<span className="mono">node server/index.js</span>，端口 8787）。恢复连接后会自动刷新。
+          </div>
+        </div>
+      )}
 
       {showLiveBanner && (
         <div className="live-banner">
@@ -1223,7 +1485,20 @@ export default function App() {
                 type="button"
                 className="btn btn-ghost"
                 onClick={async () => {
-                  if (!confirm(`确认清空「${viewModeText}」的历史平仓盈亏记录？持仓不受影响，其他模式的记录保留。`)) return;
+                  const ok = await askConfirm({
+                    title: '清空盈亏记录',
+                    tone: 'danger',
+                    confirmText: '清空记录',
+                    body: (
+                      <>
+                        <p>
+                          将清空「<b>{viewModeText}</b>」的历史平仓盈亏记录。
+                        </p>
+                        <p className="dim">持仓不受影响，其他执行方式的记录保留。</p>
+                      </>
+                    ),
+                  });
+                  if (!ok) return;
                   try {
                     const data = await api<{ pnl: PnLDashboard }>('/api/pnl/clear', {
                       method: 'POST',
@@ -1288,8 +1563,8 @@ export default function App() {
             <div className="status-grid">
               <div className="metric">
                 <div className="label">状态</div>
-                <div className={`value ${running ? 'teal' : 'dim'}`}>
-                  {running ? (scan.scanning ? 'Bootstrap/扫描中' : '运行中') : '空闲'}
+                <div className={`value ${offline ? 'dim' : running ? 'teal' : 'dim'}`}>
+                  {offline ? '未知（已失联）' : running ? (scan.scanning ? 'Bootstrap/扫描中' : '运行中') : '空闲'}
                 </div>
               </div>
               <div className="metric">
@@ -1358,15 +1633,19 @@ export default function App() {
               </div>
               <div className="metric">
                 <div className="label">WS 状态</div>
-                <div className={`value ${scan.ws?.connected ? 'teal' : running ? 'amber' : 'dim'}`}>
-                  <span className={`connection-light ${scan.ws?.connected ? 'online' : running ? 'pending' : 'offline'}`} />
-                  {!running
-                    ? '—'
-                    : scan.ws?.connected
-                      ? `已连接 (${scan.ws?.aliveCount ?? 0}/${scan.ws?.connCount ?? 0})`
-                      : scan.ws?.reconnecting
-                        ? '重连中'
-                        : '未连接'}
+                <div className={`value ${offline ? 'dim' : scan.ws?.connected ? 'teal' : running ? 'amber' : 'dim'}`}>
+                  <span
+                    className={`connection-light ${offline ? 'offline' : scan.ws?.connected ? 'online' : running ? 'pending' : 'offline'}`}
+                  />
+                  {offline
+                    ? '未知（已失联）'
+                    : !running
+                      ? '—'
+                      : scan.ws?.connected
+                        ? `已连接 (${scan.ws?.aliveCount ?? 0}/${scan.ws?.connCount ?? 0})`
+                        : scan.ws?.reconnecting
+                          ? '重连中'
+                          : '未连接'}
                 </div>
               </div>
             </div>
@@ -1387,7 +1666,13 @@ export default function App() {
         </div>
 
         {settingsOpen && <button className="settings-backdrop" aria-label="关闭策略设置" onClick={() => setSettingsOpen(false)} />}
-        <section className={`card params-card settings-drawer ${settingsOpen ? 'open' : ''}`} role="dialog" aria-modal="true" aria-label="策略设置">
+        <section
+          className={`card params-card settings-drawer ${settingsOpen ? 'open' : ''}`}
+          role="dialog"
+          aria-modal="true"
+          aria-label="策略设置"
+          ref={settingsDrawerRef}
+        >
           <div className="settings-head">
             <div>
               <div className="eyebrow">STRATEGY CONTROL</div>
@@ -1873,7 +2158,7 @@ export default function App() {
         </section>
 
         {strategyPickerOpen && (
-          <section className="strategy-picker" role="dialog" aria-modal="true" aria-label="选择策略">
+          <section className="strategy-picker" role="dialog" aria-modal="true" aria-label="选择策略" ref={strategyPickerRef}>
             <div className="strategy-picker-head">
               <button type="button" className="icon-btn" aria-label="返回策略设置" onClick={() => setStrategyPickerOpen(false)} autoFocus>
                 ←
@@ -2457,7 +2742,7 @@ export default function App() {
         const uplUsdt = p.upl != null ? p.upl : p.profit_pct != null ? (p.amount * lev * p.profit_pct) / 100 : null;
         return (
           <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="确认平仓">
-            <div className="modal close-modal">
+            <div className="modal close-modal" ref={closeDialogRef}>
               <h2>{p.exec_mode === 'okx_live' ? '⚠️ 实盘市价平仓（真实资金）' : '确认平仓'}</h2>
               <table className="data-table modal-table">
                 <tbody>
@@ -2519,8 +2804,8 @@ export default function App() {
       })()}
 
       {liveModal.open && (
-        <div className="modal-backdrop" role="dialog" aria-modal="true">
-          <div className="modal live-modal">
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="确认启动实盘">
+          <div className="modal live-modal" ref={liveDialogRef}>
             <h2>⚠️ 确认启动 OKX 实盘（真实资金）</h2>
             {liveModal.loading ? (
               <div className="demo-row">
@@ -2617,6 +2902,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {confirmReq && <ConfirmDialog request={confirmReq} onSettle={settleConfirm} />}
 
       <footer className="footer">
         <strong>风险提示：</strong>
