@@ -4,7 +4,6 @@
  * → OKX WebSocket 实时 K 线 + tickers 驱动更新（不再轮询 market indicator rsi）
  */
 import express from 'express';
-import cors from 'cors';
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFile, statSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -17,6 +16,7 @@ import { BB_DEFAULTS, clampBbCfg, applyBbFilter } from './bbFilter.js';
 import { OkxWsManager, barToCandleChannel } from './okxWs.js';
 import { loadEnvLocal } from './env.js';
 import { OkxExecutor, demoKeysConfigured, liveKeysConfigured, keysConfiguredFor, reasonText, LIVE_MAX_LEVERAGE } from './executor.js';
+import { createLocalAccess } from './localAuth.js';
 
 // 启动时加载 server/.env.local（OKX_DEMO_* 模拟盘 / OKX_LIVE_* 实盘凭证；绝不打印值）
 const envLoad = loadEnvLocal();
@@ -30,8 +30,14 @@ const OKX_REST = 'https://www.okx.com';
 const CANDLE_BOOTSTRAP_LIMIT = 100;
 
 const app = express();
-app.use(cors());
+const extraOrigins = String(process.env.LOCAL_UI_ORIGINS || '')
+  .split(',')
+  .map((x) => x.trim())
+  .filter(Boolean);
+const localAccess = createLocalAccess({ port: PORT, extraOrigins });
+app.use(localAccess.originMiddleware);
 app.use(express.json({ limit: '1mb' }));
+app.use(localAccess.mutationAuthMiddleware);
 
 /** @type {Array<{ts:string,level:string,msg:string}>} */
 const eventLog = [];
@@ -344,6 +350,8 @@ function clampConfig(body = {}) {
 // ---------- Scan state ----------
 /** @type {Map<string, object>} */
 const positions = new Map();
+/** 已开始但尚未完成本地入账的交易所开仓；key = `${exec_mode}:${instId}`。 */
+const pendingOrders = new Map();
 /** 同币冷却（普通止损 / 严重止损 / 窗口内多次止损），按执行模式分开，落盘 data/cooldowns.json */
 const coinGuard = new CoinGuard({ path: COOLDOWN_PATH, log: (level, msg) => pushLog(level, msg) });
 /** @type {Array<object>} */
@@ -440,7 +448,10 @@ function riskSnapshot(cfg = effectiveCfg(), modeOverride) {
     max_orders_per_hour: cfg.max_orders_per_hour,
     max_spread_pct: cfg.max_spread_pct,
     kill_switch: { ...riskState.killSwitch },
-    pending_opens: [...pendingOpens],
+    pending_opens: [
+      ...pendingOpens,
+      ...[...pendingOrders.values()].filter((p) => p.exec_mode === execMode).map((p) => p.instId),
+    ],
   };
 }
 
@@ -456,22 +467,63 @@ function writeJsonAtomic(path, payload) {
 function saveState() {
   try {
     const all = [...positions.values()];
+    const pending = [...pendingOrders.values()];
     writeJsonAtomic(STATE_PATH, {
       updatedAt: new Date().toISOString(),
       positions: all.filter((p) => p.exec_mode !== 'okx_live'),
       killSwitch: riskState.killSwitch,
       orderTimesByMode: { sim: orderTimesOf('sim'), okx_demo: orderTimesOf('okx_demo') },
+      pendingOrders: pending.filter((p) => p.exec_mode !== 'okx_live'),
     });
     const live = all.filter((p) => p.exec_mode === 'okx_live');
-    if (live.length || existsSync(LIVE_STATE_PATH) || orderTimesOf('okx_live').length) {
+    if (live.length || pending.some((p) => p.exec_mode === 'okx_live') || existsSync(LIVE_STATE_PATH) || orderTimesOf('okx_live').length) {
       writeJsonAtomic(LIVE_STATE_PATH, {
         updatedAt: new Date().toISOString(),
         positions: live,
         orderTimes: orderTimesOf('okx_live'),
+        pendingOrders: pending.filter((p) => p.exec_mode === 'okx_live'),
       });
     }
+    return true;
   } catch (e) {
     logThrottled('save-state', 'warn', `持仓持久化失败：${e.message}`, 60000);
+    return false;
+  }
+}
+
+function pendingOrderKey(mode, instId) {
+  return `${normExecMode(mode)}:${String(instId || '').toUpperCase()}`;
+}
+
+function pendingOrderFor(mode, instId) {
+  return pendingOrders.get(pendingOrderKey(mode, instId)) || null;
+}
+
+function updatePendingOrder(event) {
+  const mode = normExecMode(event?.exec_mode);
+  const instId = String(event?.instId || '').toUpperCase();
+  if (!isExchangeMode(mode) || !instId) return;
+  const key = pendingOrderKey(mode, instId);
+  if (event.action === 'clear') {
+    const previous = pendingOrders.get(key);
+    pendingOrders.delete(key);
+    if (!saveState() && previous) pendingOrders.set(key, previous);
+    return;
+  }
+  const previous = pendingOrders.get(key) || {};
+  pendingOrders.set(key, {
+    ...previous,
+    ...event,
+    action: undefined,
+    exec_mode: mode,
+    instId,
+    updatedAt: new Date().toISOString(),
+    createdAt: previous.createdAt || event.createdAt || new Date().toISOString(),
+  });
+  if (!saveState()) {
+    if (Object.keys(previous).length) pendingOrders.set(key, previous);
+    else pendingOrders.delete(key);
+    throw new Error('无法持久化待确认订单，已禁止发送订单');
   }
 }
 
@@ -495,6 +547,11 @@ function loadState() {
         riskState.orderTimesByMode.sim = [...legacy];
         riskState.orderTimesByMode.okx_demo = [...legacy];
       }
+      for (const p of Array.isArray(raw?.pendingOrders) ? raw.pendingOrders : []) {
+        if (p?.instId && isExchangeMode(p.exec_mode)) {
+          pendingOrders.set(pendingOrderKey(p.exec_mode, p.instId), p);
+        }
+      }
     }
     let liveList = [];
     if (existsSync(LIVE_STATE_PATH)) {
@@ -502,6 +559,9 @@ function loadState() {
       liveList = (Array.isArray(rawLive?.positions) ? rawLive.positions : []).filter((p) => p && p.instId);
       for (const p of liveList) p.exec_mode = 'okx_live';
       if (Array.isArray(rawLive?.orderTimes)) riskState.orderTimesByMode.okx_live = rawLive.orderTimes.filter((t) => Number.isFinite(t));
+      for (const p of Array.isArray(rawLive?.pendingOrders) ? rawLive.pendingOrders : []) {
+        if (p?.instId) pendingOrders.set(pendingOrderKey('okx_live', p.instId), { ...p, exec_mode: 'okx_live' });
+      }
     }
     for (const p of [...list, ...liveList]) {
       if (positions.has(p.instId)) {
@@ -518,6 +578,7 @@ function loadState() {
       );
     }
     if (riskState.killSwitch.on) pushLog('warn', '急停状态已恢复：当前禁止开新仓（可在界面「解除急停」）');
+    if (pendingOrders.size) pushLog('warn', `已恢复 ${pendingOrders.size} 个待确认订单，将在对账时自动核实并接管`);
   } catch (e) {
     pushLog('warn', `读取持仓文件失败：${e.message}`);
   }
@@ -1071,6 +1132,9 @@ function tryOpenPosition(signalRow, cfg) {
     return { status: 'skip', reason: `已有${execModeText(held.exec_mode)}持仓，不叠加开仓` };
   }
   if (pendingOpens.has(instId)) return { status: 'submitting' };
+  if (pendingOrderFor(execMode, instId)) {
+    return { status: 'submitting', reason: '存在待交易所确认的订单，暂不重复下单' };
+  }
   const cd = coinCooldown(instId, execMode);
   if (cd) return { status: 'skip', reason: cd.text, until: cd.until, cooldown: true, coinCooldown: cd.kind };
   const skip = activeSkip(instId);
@@ -1126,15 +1190,25 @@ async function startExchangeOpen(signalRow, cfg) {
       maxSpreadPct: cfg.max_spread_pct,
       profile: cfg.profile,
       onSubmit: () => recordOrderTime(execMode),
+      onPending: updatePendingOrder,
       recheck: () => recheckBuyCondition(instId, execMode),
     });
     if (r.ok) {
       positions.set(instId, r.pos);
+      // 先持久化已接管持仓，再清 pending；任一步崩溃都能在重启后继续恢复。
+      if (saveState()) updatePendingOrder({ action: 'clear', exec_mode: execMode, instId });
+      else throw new Error('成交后持仓落盘失败，pending 记录已保留等待对账');
       lastSkip.delete(instId);
-      saveState();
       // 只有真正成交入账才计为「新开」
       pushLog('info', `${tag} 新开成交入账 1 | ${instId} | 持仓 ${modePositions(execMode).length}`);
       setTimeout(() => reconcileExchange(execMode).catch(() => {}), 3000);
+    } else if (r.uncertain) {
+      logThrottled(
+        `pending:${execMode}:${instId}`,
+        'warn',
+        `${tag} ${instId} 订单结果尚未明确，已保留 pending 记录并暂停该币重复下单：${r.reason}`,
+        60 * 1000
+      );
     } else if (r.skipped) {
       if (r.skipKind === 'lock') return; // 并发保护，不冷却
       const kind = skipKindOf(r);
@@ -1145,8 +1219,12 @@ async function startExchangeOpen(signalRow, cfg) {
       logThrottled(`skip:${instId}:${r.reason}`, 'warn', `${tag} 未开仓：${r.reason}（${Math.round(ms / 60000)} 分钟内不再重试该币）`, ms);
     }
   } catch (e) {
-    const ms = setSkip(instId, `开仓失败：${e.message}`, 'error', execMode);
-    pushLog('error', `${tag} ${instId} 开仓失败：${e.message}（${Math.round(ms / 60000)} 分钟内不再重试该币）`);
+    if (pendingOrderFor(execMode, instId)) {
+      pushLog('error', `${tag} ${instId} 开仓结果不明确：${e.message}；pending 记录已保留，等待自动对账，期间不会重复下单`);
+    } else {
+      const ms = setSkip(instId, `开仓失败：${e.message}`, 'error', execMode);
+      pushLog('error', `${tag} ${instId} 开仓失败：${e.message}（${Math.round(ms / 60000)} 分钟内不再重试该币）`);
+    }
   } finally {
     pendingOpens.delete(instId);
   }
@@ -1667,6 +1745,97 @@ function finalizeExchangeClose(pos, res, { estimated = false } = {}) {
   return trade;
 }
 
+function buildRecoveredPosition(pending, exchangePos, order, ex) {
+  const saved = pending.pos ? { ...pending.pos } : {};
+  const inst = ex.getInst(pending.instId);
+  const contracts = Math.abs(Number(exchangePos?.pos) || Number(order?.accFillSz) || Number(saved.contracts) || 0);
+  const entry = Number(exchangePos?.avgPx) || Number(order?.avgPx) || Number(saved.entry_price) || Number(pending.referencePrice) || 0;
+  const leverage = Math.max(1, Number(pending.leverage) || Number(saved.leverage) || 1);
+  const ctVal = Number(saved.ctVal) || Number(inst?.ctVal) || 0;
+  const notional = contracts > 0 && ctVal > 0 && entry > 0 ? contracts * ctVal * entry : Number(saved.notional_usdt) || 0;
+  return {
+    ...saved,
+    instId: pending.instId,
+    exec_mode: pending.exec_mode,
+    simulated: false,
+    external: false,
+    entry_price: entry,
+    amount: notional > 0 ? notional / leverage : Number(pending.amount) || Number(saved.amount) || 0,
+    leverage,
+    tdMode: 'cross',
+    posSide: exchangePos?.posSide || saved.posSide || 'net',
+    order_ccy: 'USDT',
+    contracts,
+    contractsStr: ex.fmtContracts(pending.instId, contracts),
+    ctVal,
+    ctValCcy: saved.ctValCcy || inst?.ctValCcy || null,
+    notional_usdt: notional,
+    ordId: pending.ordId || saved.ordId || order?.ordId || null,
+    clOrdId: pending.clOrdId || saved.clOrdId || order?.clOrdId || null,
+    tp_pct: Number(pending.tpPct) || Number(saved.tp_pct) || effectiveCfg().take_profit_pct,
+    sl_pct: Number(pending.slPct) || Number(saved.sl_pct) || effectiveCfg().stop_loss_pct,
+    take_profit_price: saved.take_profit_price || (entry > 0 ? entry * (1 + Number(pending.tpPct || effectiveCfg().take_profit_pct) / 100) : null),
+    stop_loss_price: saved.stop_loss_price || (entry > 0 ? entry * (1 - Number(pending.slPct || effectiveCfg().stop_loss_pct) / 100) : null),
+    rsi_at_entry: pending.rsi ?? saved.rsi_at_entry ?? null,
+    rsi_closed_at_entry: pending.rsiClosed ?? saved.rsi_closed_at_entry ?? null,
+    at: saved.at || pending.createdAt || new Date().toISOString(),
+    opened_ts: Number(saved.opened_ts) || new Date(pending.createdAt || Date.now()).getTime(),
+    order_cts: Number(saved.order_cts) || Number(order?.cTime) || Number(order?.fillTime) || null,
+    profile: pending.profile || saved.profile || (pending.exec_mode === 'okx_live' ? 'live' : 'demo'),
+    mode: 'swap',
+    status: saved.status || 'open',
+    recovered_from_pending: true,
+  };
+}
+
+/** 启动/网络异常后的 pending 订单恢复：交易所一旦有仓位或成交记录，就转为本程序管理的持仓。 */
+async function recoverPendingOrders(mode, livePositions) {
+  const ex = execFor(mode);
+  const records = [...pendingOrders.values()].filter((p) => p.exec_mode === mode);
+  for (const pending of records) {
+    const existing = positions.get(pending.instId);
+    if (existing) {
+      if ((existing.exec_mode || 'sim') === mode) updatePendingOrder({ action: 'clear', exec_mode: mode, instId: pending.instId });
+      else logThrottled(`pending-collision-${mode}-${pending.instId}`, 'error', `${ex.tag} ${pending.instId} pending 无法接管：同名合约已被 ${execModeText(existing.exec_mode)} 占用`, 60000);
+      continue;
+    }
+
+    const xp = (livePositions || []).find(
+      (p) => p.instId === pending.instId && Number(p.pos) !== 0 && (p.posSide === 'long' || (p.posSide === 'net' && Number(p.pos) > 0))
+    );
+    let order = null;
+    if (!xp && (pending.ordId || pending.clOrdId)) {
+      try {
+        order = (await ex.client.getOrder(pending.instId, { ordId: pending.ordId, clOrdId: pending.clOrdId }))?.[0] || null;
+      } catch (e) {
+        logThrottled(`pending-query-${mode}-${pending.instId}`, 'warn', `${ex.tag} 核实 ${pending.instId} pending 订单失败：${e.message}`, 60000);
+      }
+    }
+
+    const filled = Number(order?.accFillSz) > 0 && Number(order?.avgPx) > 0;
+    if (pending.pos || xp || filled) {
+      const pos = buildRecoveredPosition(pending, xp, order, ex);
+      positions.set(pos.instId, pos);
+      if (saveState()) updatePendingOrder({ action: 'clear', exec_mode: mode, instId: pending.instId });
+      pushLog('warn', `${ex.tag} 已从 pending 恢复并接管 ${pending.instId}：${pos.contractsStr} 张 @ ${pos.entry_price || '待对账'}`);
+      continue;
+    }
+
+    if (order && ['canceled', 'mmp_canceled'].includes(String(order.state || '')) && !(Number(order.accFillSz) > 0)) {
+      updatePendingOrder({ action: 'clear', exec_mode: mode, instId: pending.instId });
+      pushLog('info', `${ex.tag} ${pending.instId} pending 订单已确认取消且未成交，已清理`);
+      continue;
+    }
+
+    logThrottled(
+      `pending-wait-${mode}-${pending.instId}`,
+      'warn',
+      `${ex.tag} ${pending.instId} 订单结果仍未明确，继续保留 pending 并禁止重复下单（clOrdId=${pending.clOrdId || '—'}）`,
+      5 * 60 * 1000
+    );
+  }
+}
+
 /** 对账（交易所为准）：mode = okx_demo / okx_live */
 async function reconcileExchange(mode) {
   if (!isExchangeMode(mode)) return;
@@ -1698,6 +1867,8 @@ async function reconcileExchange(mode) {
     const live = (exPos || []).filter((p) => Number(p.pos) !== 0);
     const pendingAlgoIds = new Set((algos || []).map((a) => a.algoId));
     const pendingAlgoMap = new Map((algos || []).map((a) => [a.algoId, a]));
+
+    await recoverPendingOrders(mode, live);
 
     for (const pos of modePositions(mode)) {
       const xp = live.find(
@@ -1736,6 +1907,41 @@ async function reconcileExchange(mode) {
           pos.status = 'open';
           pos.closing_since = null;
         }
+        // 手动/急停/保护性平仓若只成交了一部分，保持保护单并按指数退避继续平剩余仓位。
+        if (pos.status === 'closing' && pos.close_reason) {
+          let attached = !!(pos.algoId && pendingAlgoMap.get(pos.algoId));
+          let closeComplete = false;
+          pos.tp_sl_attached = attached;
+          const due = Date.now() >= Number(pos.close_next_retry_at || pos.close_last_submitted_at || 0);
+          if (due) {
+            try {
+              const close = await ex.marketClose(pos, pos.close_reason);
+              if (close.complete && pos.algoId) {
+                await ex.cancelProtection(pos);
+                attached = false;
+              }
+              closeComplete = close.complete;
+              pushLog(
+                close.complete ? 'sell' : 'warn',
+                `${rtag} ${pos.instId} 自动重试平仓${close.complete ? '已完成，等待入账' : `后仍剩 ${close.remaining ?? '待确认'} 张`}`
+              );
+            } catch (e) {
+              pos.close_last_error = e.message;
+              pos.close_next_retry_at = Date.now() + Math.min(5 * 60 * 1000, 15000 * Math.pow(2, Math.min(Number(pos.close_attempts) || 0, 5)));
+              pushLog('error', `${rtag} ${pos.instId} 自动重试平仓失败：${e.message}（保留/恢复保护单后继续重试）`);
+            }
+          }
+          if (!closeComplete && !attached && pos.status === 'closing') {
+            try {
+              await ex.placeProtection(pos, pos.tp_pct ?? cfg.take_profit_pct, pos.sl_pct ?? cfg.stop_loss_pct);
+              attached = true;
+              pushLog('warn', `${rtag} ${pos.instId} 平仓尚未确认完成，已重新挂全仓止盈止损保护`);
+            } catch (e) {
+              pushLog('error', `${rtag} ${pos.instId} 剩余仓位保护单恢复失败：${e.message}（将继续自动平仓，请立即关注）`);
+            }
+          }
+          continue;
+        }
         if (pos.status === 'open') {
           const algo = pos.algoId ? pendingAlgoMap.get(pos.algoId) : null;
           const attached = !!algo;
@@ -1747,6 +1953,7 @@ async function reconcileExchange(mode) {
           if (attached) {
             pos.algo_close_fraction = String(algo.closeFraction || '') === '1';
             pos.algo_sz = pos.algo_close_fraction ? null : algo.sz;
+            pos.recovered_from_pending = false;
           }
           if (attached && !full && age > 5000) {
             // 止盈止损只覆盖部分仓位 → 撤销并按交易所均价重新挂全仓位 OCO；失败则保护性平仓
@@ -1775,7 +1982,7 @@ async function reconcileExchange(mode) {
               }
             }
           }
-          if (!attached && age > 15000) {
+          if (!attached && (age > 15000 || pos.recovered_from_pending)) {
             // 保护单缺失：若已触发则等待交易所平仓；否则重新挂单，失败则保护性平仓
             let state = null;
             if (pos.algoId) {
@@ -1792,6 +1999,7 @@ async function reconcileExchange(mode) {
               pushLog('warn', `${ex.tag} ${pos.instId} 交易所止盈止损委托缺失（状态 ${state || '无'}），尝试重新挂单`);
               try {
                 await ex.placeProtection(pos, pos.tp_pct ?? cfg.take_profit_pct, pos.sl_pct ?? cfg.stop_loss_pct);
+                pos.recovered_from_pending = false;
               } catch (e) {
                 pushLog('error', `${ex.tag} ${pos.instId} 重新挂止盈止损失败：${e.message} → 保护性市价平仓`);
                 pos.close_reason = 'failsafe';
@@ -1948,6 +2156,9 @@ async function liveStartChecks(cfg) {
 }
 
 // ---------- Routes ----------
+
+/** 同源前端获取内存会话令牌；令牌每次后端重启都会变化，且不写入磁盘或日志。 */
+app.get('/api/session', localAccess.sessionHandler);
 
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -2252,9 +2463,9 @@ app.post('/api/position/close', async (req, res) => {
     const ex = execFor(pos.exec_mode);
     try {
       pos.close_reason = 'manual';
-      if (pos.algoId) await ex.cancelProtection(pos);
-      await ex.marketClose(pos, 'manual'); // 内部按交易所持仓张数全平
-      pushLog('sell', `[手动平仓] ${ex.envText} ${instId} 已提交市价平仓，等待对账确认`);
+      const close = await ex.marketClose(pos, 'manual'); // 内部按交易所持仓张数全平并确认剩余数量
+      if (close.complete && pos.algoId) await ex.cancelProtection(pos);
+      pushLog('sell', `[手动平仓] ${ex.envText} ${instId} 已提交市价平仓，${close.complete ? '等待对账入账' : '尚有剩余仓位，保护单已保留并将自动重试'}`);
       setTimeout(() => reconcileExchange(pos.exec_mode).catch(() => {}), 2500);
     } catch (e) {
       pos.close_reason = null;
@@ -2473,8 +2684,8 @@ app.post('/api/kill', async (req, res) => {
         }
         try {
           pos.close_reason = 'kill';
-          if (pos.algoId) await ex.cancelProtection(pos);
-          await ex.marketClose(pos, 'kill'); // 内部按交易所持仓张数全平
+          const close = await ex.marketClose(pos, 'kill'); // 先平仓，确认完整后才撤保护，避免失败时裸仓
+          if (close.complete && pos.algoId) await ex.cancelProtection(pos);
           results.push({ instId: pos.instId, ok: true, exec_mode: pos.exec_mode });
         } catch (e) {
           pushLog('error', `[急停] ${ex.envText} ${pos.instId} 平仓失败：${e.message}`);

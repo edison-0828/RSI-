@@ -361,9 +361,9 @@ export class OkxExecutor {
 
   /**
    * 市价开多（完整流程：规格 → 点差 → 余额 → 张数 → 杠杆 → 下单 → 查成交 → OCO）
-   * @returns {Promise<{ok:true,pos:object}|{ok:false,skipped?:boolean,reason:string}>}
+   * @returns {Promise<{ok:true,pos:object}|{ok:false,skipped?:boolean,uncertain?:boolean,reason:string}>}
    */
-  async openLong({ instId, amount, leverage, tpPct, slPct, rsi, rsiClosed, maxSpreadPct, profile = 'demo', onSubmit, recheck }) {
+  async openLong({ instId, amount, leverage, tpPct, slPct, rsi, rsiClosed, maxSpreadPct, profile = 'demo', onSubmit, onPending, recheck }) {
     if (this.locks.has(instId)) return { ok: false, skipped: true, skipKind: 'lock', reason: `${instId} 正在下单中，跳过重复开仓` };
     this.locks.add(instId);
     try {
@@ -435,15 +435,53 @@ export class OkxExecutor {
       const clOrdId = genId('rsio');
       const body = { instId, tdMode: 'cross', side: 'buy', ordType: 'market', sz: size.contractsStr, clOrdId };
       if (longShort) body.posSide = 'long';
+      // 必须先持久化意图再发单。若落盘失败，回调会抛错并阻止真实订单发送。
+      onPending?.({
+        action: 'upsert',
+        exec_mode: this.mode,
+        instId,
+        phase: 'prepared',
+        clOrdId,
+        amount,
+        leverage: lever,
+        tpPct,
+        slPct,
+        rsi: rsiNow ?? null,
+        rsiClosed: rsiClosedNow ?? null,
+        profile,
+        contractsStr: size.contractsStr,
+        referencePrice: tk.askPx,
+        createdAt: new Date().toISOString(),
+      });
       this.log('info', `${this.tag} 提交市价买入 ${instId} ${size.contractsStr} 张 | ${lever}x 全仓 | 参考卖一 ${tk.askPx} | clOrdId=${clOrdId}`);
       try {
         onSubmit?.();
       } catch {
         /* ignore */
       }
-      const placed = await this._placeOrderIdempotent(body);
+      let placed;
+      try {
+        placed = await this._placeOrderIdempotent(body);
+      } catch (e) {
+        if (e instanceof OkxApiError && e.network) {
+          try {
+            onPending?.({ action: 'upsert', exec_mode: this.mode, instId, phase: 'uncertain', clOrdId, error: e.message });
+          } catch {
+            /* 首次 pending 已经落盘，保留它即可 */
+          }
+          e.orderUncertain = true;
+        } else {
+          onPending?.({ action: 'clear', exec_mode: this.mode, instId });
+        }
+        throw e;
+      }
       const ordId = placed.ordId;
       if (!ordId) throw new Error(`${instId} 下单未返回 ordId`);
+      try {
+        onPending?.({ action: 'upsert', exec_mode: this.mode, instId, phase: 'submitted', clOrdId, ordId });
+      } catch (e) {
+        this.log('error', `${this.tag} ${instId} 已提交订单但更新 pending 失败：${e.message}（保留先前记录继续保护）`);
+      }
 
       const { order: od, final } = await this._waitFill(instId, ordId, 15000);
       let filled = Number(od?.accFillSz || 0);
@@ -469,7 +507,25 @@ export class OkxExecutor {
         this.log('warn', `${this.tag} ${instId} 读取交易所持仓失败（暂用订单成交数据）：${e.message}`);
       }
       if (!(filled > 0) || !(avgPx > 0)) {
-        return { ok: false, reason: `${instId} 市价单未成交（state=${od?.state || '未知'}），ordId=${ordId}` };
+        const terminalNoFill = final && ['canceled', 'mmp_canceled'].includes(String(od?.state || '')) && !(filled > 0);
+        if (terminalNoFill) {
+          onPending?.({ action: 'clear', exec_mode: this.mode, instId });
+          return { ok: false, skipped: true, reason: `${instId} 市价单已取消且未成交（state=${od?.state}），ordId=${ordId}` };
+        }
+        try {
+          onPending?.({
+            action: 'upsert',
+            exec_mode: this.mode,
+            instId,
+            phase: 'uncertain',
+            clOrdId,
+            ordId,
+            orderState: od?.state || null,
+          });
+        } catch {
+          /* 保留先前已落盘的 pending */
+        }
+        return { ok: false, uncertain: true, reason: `${instId} 市价单成交结果尚未明确（state=${od?.state || '未知'}），ordId=${ordId}` };
       }
 
       const pos = {
@@ -510,6 +566,11 @@ export class OkxExecutor {
         mode: 'swap',
         status: 'open',
       };
+      try {
+        onPending?.({ action: 'upsert', exec_mode: this.mode, instId, phase: 'filled', clOrdId, ordId, pos });
+      } catch (e) {
+        this.log('error', `${this.tag} ${instId} 成交后更新 pending 失败：${e.message}（继续优先挂保护单）`);
+      }
       this.log(
         'buy',
         `${this.buyTag} ${instId} 持仓 ${pos.contractsStr} 张 @ 均价 ${avgPx} | ${lever}x 全仓 | 名义约 ${pos.notional_usdt.toFixed(2)} USDT | 手续费 ${fee} | 实时RSI=${fmtRsi(
@@ -528,6 +589,11 @@ export class OkxExecutor {
         } catch (e2) {
           this.log('error', `${this.tag} ${instId} 保护性平仓也失败：${e2.message}（请立即在 OKX ${this.envText}手动处理！）`);
         }
+      }
+      try {
+        onPending?.({ action: 'upsert', exec_mode: this.mode, instId, phase: 'filled', clOrdId, ordId, pos });
+      } catch {
+        /* index 仍会持久化最终持仓；先前 pending 可供崩溃恢复 */
       }
       return { ok: true, pos };
     } finally {
@@ -649,12 +715,46 @@ export class OkxExecutor {
     };
     if (pos.posSide === 'long') body.posSide = 'long';
     else body.reduceOnly = true;
+    const requestedContracts = Number(pos.contracts) || 0;
     const r = await this._placeOrderIdempotent(body);
+    if (!r.ordId) throw new Error(`${pos.instId} 平仓未返回 ordId`);
     pos.status = 'closing';
     pos.close_reason = pos.close_reason || reason;
-    pos.close_ordId = r.ordId || null;
-    this.log('sell', `${this.tag} 已提交市价平仓 ${pos.instId} ${pos.contractsStr} 张（原因：${reasonText(reason)}）ordId=${r.ordId || '—'}`);
-    return r;
+    pos.close_ordId = r.ordId;
+    pos.close_attempts = (Number(pos.close_attempts) || 0) + 1;
+    pos.close_requested_at = pos.close_requested_at || Date.now();
+    pos.close_last_submitted_at = Date.now();
+    pos.close_next_retry_at = Date.now() + Math.min(5 * 60 * 1000, 15000 * Math.pow(2, Math.min(pos.close_attempts - 1, 5)));
+    pos.close_last_error = null;
+    this.log('sell', `${this.tag} 已提交市价平仓 ${pos.instId} ${pos.contractsStr} 张（原因：${reasonText(reason)}）ordId=${r.ordId}`);
+
+    let waited = { order: null, final: false };
+    try {
+      waited = await this._waitFill(pos.instId, r.ordId, 15000);
+    } catch (e) {
+      this.log('warn', `${this.tag} ${pos.instId} 查询平仓成交结果失败：${e.message}（由对账继续确认）`);
+    }
+    const filled = Number(waited.order?.accFillSz || 0);
+    let remaining = null;
+    try {
+      const after = await this.getExchangeLong(pos.instId);
+      remaining = after?.pos > 0 ? Number(after.pos) : 0;
+      if (remaining > 0) {
+        pos.contracts = remaining;
+        pos.contractsStr = this.fmtContracts(pos.instId, remaining);
+        if (after.avgPx > 0) pos.entry_price = after.avgPx;
+      }
+    } catch (e) {
+      this.log('warn', `${this.tag} ${pos.instId} 平仓后查询剩余仓位失败：${e.message}（保留保护单并由对账继续确认）`);
+    }
+    const complete = remaining === 0 || (remaining == null && waited.final && filled >= requestedContracts - 1e-9);
+    if (!complete) {
+      this.log(
+        'warn',
+        `${this.tag} ${pos.instId} 平仓尚未完成（已成交 ${filled}/${requestedContracts} 张，剩余 ${remaining == null ? '待确认' : remaining}），保留保护并自动重试`
+      );
+    }
+    return { ...r, final: waited.final, filled, remaining, complete };
   }
 
   fetchPositions() {

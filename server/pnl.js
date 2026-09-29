@@ -4,19 +4,23 @@
  * - OKX 实盘（okx_live）：单独存放 server/data/live/pnl-ledger.json
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { usedKeysFromTrades } from './closeMatch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, 'data');
+const DATA_DIR = process.env.RSI_BOTTOM_HUNTER_DATA_DIR
+  ? resolve(process.env.RSI_BOTTOM_HUNTER_DATA_DIR)
+  : join(__dirname, 'data');
 const LIVE_DIR = join(DATA_DIR, 'live');
 const MAX_TRADES = 500;
+const MAX_RISK_EVENTS = 10_000;
+const RISK_RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
 
-/** @type {Record<'main'|'live', { path: string, trades: Array<object> }>} */
+/** @type {Record<'main'|'live', { path: string, trades: Array<object>, riskEvents: Array<object> }>} */
 const LEDGERS = {
-  main: { path: join(DATA_DIR, 'pnl-ledger.json'), trades: [] },
-  live: { path: join(LIVE_DIR, 'pnl-ledger.json'), trades: [] },
+  main: { path: join(DATA_DIR, 'pnl-ledger.json'), trades: [], riskEvents: [] },
+  live: { path: join(LIVE_DIR, 'pnl-ledger.json'), trades: [], riskEvents: [] },
 };
 
 export const EXEC_MODE_TEXT = { sim: '本地模拟', okx_demo: 'OKX 模拟盘', okx_live: 'OKX 实盘' };
@@ -33,12 +37,24 @@ function loadOne(L) {
   try {
     if (!existsSync(L.path)) {
       L.trades = [];
+      L.riskEvents = [];
       return;
     }
     const raw = JSON.parse(readFileSync(L.path, 'utf8'));
     L.trades = Array.isArray(raw?.trades) ? raw.trades : [];
+    // 旧账本没有 riskEvents 时，用现存交易补建；之后清空展示历史不会再影响风控累计。
+    L.riskEvents = Array.isArray(raw?.riskEvents)
+      ? raw.riskEvents
+      : L.trades.map((t) => ({
+          id: t.id,
+          exec_mode: t.exec_mode || 'sim',
+          closed_at: t.closed_at,
+          pnl_usdt: Number(t.pnl_usdt) || 0,
+        }));
+    pruneRiskEvents(L);
   } catch {
     L.trades = [];
+    L.riskEvents = [];
   }
 }
 
@@ -52,17 +68,33 @@ function saveOne(L) {
     const dir = dirname(L.path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const tmp = `${L.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ updatedAt: new Date().toISOString(), trades: L.trades }, null, 2), 'utf8');
+    writeFileSync(
+      tmp,
+      JSON.stringify({ updatedAt: new Date().toISOString(), trades: L.trades, riskEvents: L.riskEvents }, null, 2),
+      'utf8'
+    );
     renameSync(tmp, L.path);
   } catch {
     /* ignore disk errors */
   }
 }
 
+function pruneRiskEvents(L, now = Date.now()) {
+  const cutoff = now - RISK_RETENTION_MS;
+  L.riskEvents = (Array.isArray(L.riskEvents) ? L.riskEvents : [])
+    .filter((e) => new Date(e?.closed_at || 0).getTime() >= cutoff)
+    .slice(0, MAX_RISK_EVENTS);
+}
+
 /** 指定模式的交易（execMode 为空 = 全部账本） */
 function tradesOf(execMode) {
   if (!execMode) return [...LEDGERS.main.trades, ...LEDGERS.live.trades].sort((a, b) => String(b.closed_at).localeCompare(String(a.closed_at)));
   return ledgerFor(execMode).trades.filter((t) => (t.exec_mode || 'sim') === execMode);
+}
+
+function riskEventsOf(execMode) {
+  if (!execMode) return [...LEDGERS.main.riskEvents, ...LEDGERS.live.riskEvents];
+  return ledgerFor(execMode).riskEvents.filter((e) => (e.exec_mode || 'sim') === execMode);
 }
 
 /**
@@ -115,6 +147,13 @@ export function recordClose(pos, exitPrice, action, profitPct, extra = {}) {
   const L = ledgerFor(execMode);
   L.trades.unshift(trade);
   if (L.trades.length > MAX_TRADES) L.trades.length = MAX_TRADES;
+  L.riskEvents.unshift({
+    id: trade.id,
+    exec_mode: execMode,
+    closed_at: trade.closed_at,
+    pnl_usdt: pnlUsdt,
+  });
+  pruneRiskEvents(L);
   saveOne(L);
   return trade;
 }
@@ -128,7 +167,7 @@ export function usedCloseKeys(execMode) {
 export function todayRealized(execMode) {
   const day0 = startOfLocalDay();
   let sum = 0;
-  for (const t of tradesOf(execMode)) {
+  for (const t of riskEventsOf(execMode)) {
     const closedAt = t.closed_at ? new Date(t.closed_at).getTime() : 0;
     if (closedAt < day0) continue;
     sum += Number(t.pnl_usdt) || 0;
@@ -169,16 +208,13 @@ export function buildPnLDashboard(openPositions = [], execMode) {
   let realized = 0;
   let wins = 0;
   let losses = 0;
-  let todayRealizedSum = 0;
-  const day0 = startOfLocalDay();
+  const todayRealizedSum = todayRealized(execMode);
 
   for (const t of closed) {
     const pnl = Number(t.pnl_usdt) || 0;
     realized += pnl;
     if (pnl > 0) wins++;
     else if (pnl < 0) losses++;
-    const closedAt = t.closed_at ? new Date(t.closed_at).getTime() : 0;
-    if (closedAt >= day0) todayRealizedSum += pnl;
   }
 
   let unrealized = 0;

@@ -566,12 +566,36 @@ function rsiTone(rsi: number | null | undefined, threshold: number) {
   return 'normal';
 }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
-    ...init,
-  });
+let sessionTokenPromise: Promise<string> | null = null;
+
+async function getSessionToken(force = false) {
+  if (force) sessionTokenPromise = null;
+  if (!sessionTokenPromise) {
+    sessionTokenPromise = fetch('/api/session', { cache: 'no-store' })
+      .then(async (res) => {
+        const data = (await res.json().catch(() => ({}))) as { token?: string; error?: string };
+        if (!res.ok || !data.token) throw new Error(data.error || `无法建立本地会话（HTTP ${res.status}）`);
+        return data.token;
+      })
+      .catch((error) => {
+        sessionTokenPromise = null;
+        throw error;
+      });
+  }
+  return sessionTokenPromise;
+}
+
+async function api<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
+  const method = String(init?.method || 'GET').toUpperCase();
+  const mutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+  const headers = new Headers(init?.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  if (mutation) headers.set('X-RSI-Session', await getSessionToken(retried));
+  const res = await fetch(path, { ...init, headers });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && mutation && !retried) {
+    return api<T>(path, init, true);
+  }
   if (!res.ok) {
     throw new Error((data as { error?: string }).error || `HTTP ${res.status}`);
   }

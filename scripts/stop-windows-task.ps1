@@ -5,9 +5,11 @@ $serverPath = Join-Path $projectDir 'server\index.js'
 $port = 5173
 
 try {
+  $session = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/session" -TimeoutSec 3
+  $headers = @{ 'X-RSI-Session' = $session.token }
   $status = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/scan/status" -TimeoutSec 3
   if ($status.scan.running) {
-    Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/scan/stop" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 5 | Out-Null
+    Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/scan/stop" -Method Post -Headers $headers -ContentType 'application/json' -Body '{}' -TimeoutSec 5 | Out-Null
   }
 } catch {
   # The server may already be down.
