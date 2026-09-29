@@ -70,7 +70,20 @@ function pushLog(level, msg) {
   return entry;
 }
 
-/** Resolve okx binary: prefer local `okx`, else npx (Windows-safe) */
+/** Windows cmd.exe 默认 GBK；按 UTF-8 读会变成 ◆ / �。优先 UTF-8，失败再按 gb18030。 */
+function decodeChildOutput(buf) {
+  if (!buf || !buf.length) return '';
+  const buffer = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  const utf8 = buffer.toString('utf8');
+  if (process.platform !== 'win32' || !utf8.includes('\uFFFD')) return utf8;
+  try {
+    return new TextDecoder('gb18030').decode(buffer);
+  } catch {
+    return utf8;
+  }
+}
+
+/** Resolve okx binary: prefer local `okx`, else npx via node（避开 Windows 路径空格） */
 function resolveOkxCmd() {
   const isWin = process.platform === 'win32';
   const home = process.env.HOME || process.env.USERPROFILE || '';
@@ -87,13 +100,23 @@ function resolveOkxCmd() {
     if (p && existsSync(p)) return { cmd: p, argsPrefix: [], shell: false };
   }
   const nodeDir = dirname(process.execPath);
+  const npxArgs = ['--yes', '@okx_ai/okx-trade-cli@latest'];
+  // 走 node npx-cli.js，不要 spawn `C:\Program Files\nodejs\npx.cmd` + shell:true：
+  // cmd.exe 会在空格处拆开，变成 `'C:\Program' 不是内部或外部命令`，再被 UTF-8 误读成乱码。
+  const npxCliJs = join(nodeDir, 'node_modules', 'npm', 'bin', 'npx-cli.js');
+  if (existsSync(npxCliJs)) {
+    return { cmd: process.execPath, argsPrefix: [npxCliJs, ...npxArgs], shell: false };
+  }
   const npxLocal = isWin ? join(nodeDir, 'npx.cmd') : join(nodeDir, 'npx');
   const npxCmd = existsSync(npxLocal) ? npxLocal : (isWin ? 'npx.cmd' : 'npx');
-  return {
-    cmd: npxCmd,
-    argsPrefix: ['--yes', '@okx_ai/okx-trade-cli@latest'],
-    shell: isWin,
-  };
+  if (isWin) {
+    return {
+      cmd: npxCmd.includes(' ') ? `"${npxCmd}"` : npxCmd,
+      argsPrefix: npxArgs,
+      shell: true,
+    };
+  }
+  return { cmd: npxCmd, argsPrefix: npxArgs, shell: false };
 }
 
 function runOkx(args, { timeoutMs = 60000 } = {}) {
@@ -106,20 +129,22 @@ function runOkx(args, { timeoutMs = 60000 } = {}) {
       shell: Boolean(shell),
       windowsHide: true,
     });
-    let stdout = '';
-    let stderr = '';
+    const stdoutChunks = [];
+    const stderrChunks = [];
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`okx 命令超时 (${timeoutMs}ms): ${fullArgs.join(' ')}`));
     }, timeoutMs);
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
+    child.stdout.on('data', (d) => { stdoutChunks.push(d); });
+    child.stderr.on('data', (d) => { stderrChunks.push(d); });
     child.on('error', (err) => {
       clearTimeout(timer);
       reject(err);
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      const stdout = decodeChildOutput(Buffer.concat(stdoutChunks));
+      const stderr = decodeChildOutput(Buffer.concat(stderrChunks));
       if (code !== 0) {
         const errMsg = (stderr || stdout || `exit ${code}`).trim().slice(0, 800);
         reject(new Error(errMsg || `okx exited ${code}`));

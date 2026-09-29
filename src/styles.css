@@ -775,6 +775,52 @@ button, input, select {
   background: rgba(225, 29, 72, 0.08);
 }
 
+/* 后端失联：界面上的数据全是旧的，必须比实盘提示更难忽略 */
+.offline-banner {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 2px solid var(--amber);
+  background: linear-gradient(135deg, rgba(180, 83, 9, 0.38), rgba(245, 158, 11, 0.16));
+  color: #fef3c7;
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.25), 0 6px 24px rgba(245, 158, 11, 0.2);
+}
+.offline-banner-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: #fffbeb;
+}
+.offline-banner-body {
+  margin-top: 4px;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+.offline-banner-body .mono {
+  font-family: var(--mono);
+}
+.offline-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6);
+  animation: offline-pulse 1.4s ease-out infinite;
+}
+@keyframes offline-pulse {
+  70% { box-shadow: 0 0 0 10px rgba(245, 158, 11, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+}
+/* 失联期间这些状态无法确认，一律降级成灰色，不能再显示成正常运行 */
+.badge.stale {
+  border-color: var(--border-strong);
+  background: rgba(93, 109, 130, 0.18);
+  color: var(--text-mute);
+}
+
 /* 实盘确认框 */
 .modal-backdrop {
   position: fixed;
@@ -1449,6 +1495,37 @@ body {
 .modal-actions {
   justify-content: flex-end;
   margin-top: 14px;
+}
+
+.confirm-modal {
+  max-width: 460px;
+}
+.confirm-body {
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--text);
+}
+.confirm-body p {
+  margin: 0 0 8px;
+}
+.confirm-body p:last-child {
+  margin-bottom: 0;
+}
+.confirm-body .dim {
+  color: var(--text-dim);
+  font-size: 0.86rem;
+}
+
+/* 键盘操作时必须能看见焦点，尤其是平仓/急停这些弹窗里 */
+:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.modal :focus-visible,
+.settings-drawer :focus-visible,
+.strategy-picker :focus-visible {
+  outline-color: #7dd3fc;
 }
 
 /* ── 当前策略卡：策略设置的入口，点「切换策略」进策略库 ── */
