@@ -2,6 +2,7 @@
  * 极简 .env 加载器（无第三方依赖）
  * - 仅读取 server/.env.local（已加入 .gitignore）：OKX_DEMO_* 模拟盘 / OKX_LIVE_* 实盘凭证
  * - 不覆盖已存在的系统环境变量
+ * - RSI_NO_ENV_LOCAL=1 时完全不读取 server/.env.local（测试 / 回放 / 升级演练用，避免加载真实 Key）
  * - 绝不打印任何变量的值
  */
 import { existsSync, readFileSync } from 'fs';
@@ -16,6 +17,10 @@ export const ENV_LOCAL_PATH = join(__dirname, '.env.local');
  * @returns {{ loaded: boolean, count: number, keys: string[], error?: string }}
  */
 export function loadEnvLocal(file = ENV_LOCAL_PATH) {
+  // 仅针对默认的 .env.local；显式传入的其它文件（如测试夹具）不受此开关影响
+  if (file === ENV_LOCAL_PATH && process.env.RSI_NO_ENV_LOCAL === '1') {
+    return { loaded: false, count: 0, keys: [], skipped: true };
+  }
   if (!existsSync(file)) return { loaded: false, count: 0, keys: [] };
   try {
     let text = readFileSync(file, 'utf8');

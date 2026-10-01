@@ -4,14 +4,13 @@
  * - OKX 实盘（okx_live）：单独存放 server/data/live/pnl-ledger.json
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'fs';
-import { dirname, join, resolve } from 'path';
-import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { usedKeysFromTrades } from './closeMatch.js';
+import { resolveDataDir } from './dataDir.js';
+import { profitPct as calcProfitPct } from './engine/positionMath.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.RSI_BOTTOM_HUNTER_DATA_DIR
-  ? resolve(process.env.RSI_BOTTOM_HUNTER_DATA_DIR)
-  : join(__dirname, 'data');
+// 数据目录：RSI_DATA_DIR（新）优先，其次 RSI_BOTTOM_HUNTER_DATA_DIR（旧），否则 server/data
+const DATA_DIR = resolveDataDir();
 const LIVE_DIR = join(DATA_DIR, 'live');
 const MAX_TRADES = 500;
 const MAX_RISK_EVENTS = 10_000;
@@ -229,7 +228,7 @@ export function buildPnLDashboard(openPositions = [], execMode) {
       p.profit_pct != null
         ? Number(p.profit_pct)
         : entry > 0 && Number.isFinite(price)
-          ? ((price - entry) / entry) * 100
+          ? calcProfitPct(entry, price)
           : 0;
     if (!Number.isFinite(pct)) pct = 0;
     // OKX 模拟盘/实盘持仓优先使用交易所返回的未实现盈亏 upl

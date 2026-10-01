@@ -163,6 +163,15 @@ npm run dev
 - 每小时下单数与今日已实现盈亏按执行方式分开统计
 - 急停全部平仓会按交易所持仓数量平掉本程序开的实盘仓位（外部手动仓位不动）
 
+## 测试 / 演练用环境变量（可选，默认全部不设置 = 行为不变）
+
+- `RSI_DATA_DIR`：把 `server/data` 重定向到其它目录（旧变量 `RSI_BOTTOM_HUNTER_DATA_DIR` 仍然有效，新变量优先）
+- `RSI_NO_ENV_LOCAL=1`：不读取 `server/.env.local`
+- `RSI_NO_LISTEN=1`：import `server/index.js` 时不监听端口、不启动对账定时器（务必同时设置 `RSI_DATA_DIR`）
+- `RSI_ENGINE_SHADOW=1`：影子运行，仅比对“旧判断 vs 策略 evaluate”，不一致写 `[回归]` 警告日志，不影响下单
+
+策略接口说明见 `server/strategies/README.md`。
+
 ## 目录结构
 
 ```
@@ -177,6 +186,8 @@ npm run dev
 │   ├── okxWs.js           # OKX WebSocket
 │   ├── pnl.js             # 盈亏计算
 │   ├── candleStore.js     # K线数据存储
+│   ├── strategies/        # 策略接口、注册表、RSI 抄底策略
+│   ├── engine/            # 持仓数学、信号适配等引擎纯函数
 │   └── env.js             # 环境变量
 ├── package.json           # 项目配置
 └── vite.config.ts         # Vite 配置
