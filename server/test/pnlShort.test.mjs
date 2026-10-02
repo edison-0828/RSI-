@@ -20,11 +20,11 @@ async function freshPnl() {
 test('账本：空头价格下跌记为盈利，上涨记为亏损；带 direction / strategy_id；flip 动作；仪表盘分策略 / 分方向汇总', async () => {
   const { pnl, restore } = await freshPnl();
   try {
-    const S = { instId: 'ETH-USDT-SWAP', exec_mode: 'sim', direction: 'short', strategy_id: 'supertrend', strategy_version: 1, signal_meta: { flip_bar_ts: 1 }, amount: 100, leverage: 2, entry_price: 100, at: new Date().toISOString(), simulated: true, mode: 'swap' };
+    const S = { instId: 'ETH-USDT-SWAP', exec_mode: 'sim', direction: 'short', strategy_id: 'rsi_pullback', strategy_version: 1, signal_meta: { signal_bar_ts: 1 }, amount: 100, leverage: 2, entry_price: 100, at: new Date().toISOString(), simulated: true, mode: 'swap' };
     const t1 = pnl.recordClose(S, 90, 'flip', 10, {});
     assert.equal(t1.direction, 'short');
     assert.equal(t1.side, 'short');
-    assert.equal(t1.strategy_id, 'supertrend');
+    assert.equal(t1.strategy_id, 'rsi_pullback');
     assert.equal(t1.action, 'flip');
     assert.ok(Math.abs(t1.pnl_usdt - 20) < 1e-9, '保证金100 × 2x × 10% = 20 盈利');
     const t2 = pnl.recordClose({ ...S, instId: 'A-USDT-SWAP' }, 110, 'sl', -10, {});
@@ -37,7 +37,7 @@ test('账本：空头价格下跌记为盈利，上涨记为亏损；带 directi
     const legacy = pnl.recordClose({ instId: 'C-USDT-SWAP', exec_mode: 'sim', amount: 10, leverage: 1, entry_price: 1, at: new Date().toISOString() }, 1.1, 'tp', 10, {});
     assert.equal(legacy.direction, 'long');
     assert.equal(legacy.strategy_id, 'rsi_dip');
-    const dash = pnl.buildPnLDashboard([{ instId: 'OPEN-USDT-SWAP', exec_mode: 'sim', direction: 'short', strategy_id: 'supertrend', amount: 100, leverage: 1, entry_price: 100, last_price: 95 }], 'sim');
+    const dash = pnl.buildPnLDashboard([{ instId: 'OPEN-USDT-SWAP', exec_mode: 'sim', direction: 'short', strategy_id: 'rsi_pullback', amount: 100, leverage: 1, entry_price: 100, last_price: 95 }], 'sim');
     assert.equal(dash.open[0].direction, 'short');
     assert.ok(Math.abs(dash.open[0].pnl_usdt - 5) < 1e-9, '空头价格 100→95，浮盈 +5');
     assert.ok(dash.by_strategy && dash.by_direction, '分策略 / 分方向汇总');
@@ -61,43 +61,44 @@ test('closeMatch：先多后空反手时，空头不会匹配到上一笔多头�
   assert.equal(pickCloseRecord([shortRec, longRec], longPos), longRec);
 });
 
-test('coinGuard：supertrend 灾难止损冷却（按策略隔离，信号平仓不冷却）；旧版冷却文件（无 strategy_id）加载后归入 rsi_dip', () => {
+test('coinGuard：rsi_pullback 灾难止损冷却按策略隔离；旧版冷却归入 rsi_dip', () => {
   const dir = mkdtempSync(join(tmpdir(), 'st-guard-'));
   try {
     let now = Date.parse('2026-10-01T10:00:00+08:00');
     const g = new CoinGuard({ path: join(dir, 'cooldowns.json'), now: () => now, log: () => {} });
-    const r = g.onDisasterStop('sim', 'BTC-USDT-SWAP', { strategyId: 'supertrend', minutes: 60, lossPct: -8 });
+    const r = g.onDisasterStop('sim', 'BTC-USDT-SWAP', { strategyId: 'rsi_pullback', minutes: 60, lossPct: -8 });
     assert.equal(r.kind, 'disaster');
-    assert.match(g.check('sim', 'BTC-USDT-SWAP', 'supertrend').text, /灾难止损/);
+    assert.match(g.check('sim', 'BTC-USDT-SWAP', 'rsi_pullback').text, /灾难止损/);
     assert.equal(g.check('sim', 'BTC-USDT-SWAP', 'rsi_dip'), null, '不同策略互不影响');
-    assert.equal(g.check('okx_demo', 'BTC-USDT-SWAP', 'supertrend'), null, '不同模式互不影响');
-    assert.equal(g.onDisasterStop('sim', 'X-USDT-SWAP', { strategyId: 'supertrend', minutes: 0 }), null, 'minutes=0 → 不冷却');
+    assert.equal(g.check('okx_demo', 'BTC-USDT-SWAP', 'rsi_pullback'), null, '不同模式互不影响');
+    assert.equal(g.onDisasterStop('sim', 'X-USDT-SWAP', { strategyId: 'rsi_pullback', minutes: 0 }), null, 'minutes=0 → 不冷却');
     const saved = JSON.parse(readFileSync(join(dir, 'cooldowns.json'), 'utf8'));
     assert.equal(saved.version, 2);
-    assert.equal(saved.items.some((x) => x.strategy_id === 'supertrend'), true);
+    assert.equal(saved.items.some((x) => x.strategy_id === 'rsi_pullback'), true);
     now += 61 * 60 * 1000;
-    assert.equal(g.check('sim', 'BTC-USDT-SWAP', 'supertrend'), null, '60 分钟后解除');
+    assert.equal(g.check('sim', 'BTC-USDT-SWAP', 'rsi_pullback'), null, '60 分钟后解除');
     // 旧版文件：{version:1,items:[{instId,exec_mode,slTimes,cooldown}]}（无 strategy_id）
     const until = now + 3600_000;
     writeFileSync(join(dir, 'cooldowns.json'), JSON.stringify({ version: 1, items: [{ instId: 'SENT-USDT-SWAP', exec_mode: 'okx_live', slTimes: [now - 1000], cooldown: { until, kind: 'normal', reason: 'x', at: now - 1000 } }] }));
     const g2 = new CoinGuard({ path: join(dir, 'cooldowns.json'), now: () => now, log: () => {} });
     assert.equal(g2.load(GUARD_DEFAULTS), 1);
     assert.ok(g2.check('okx_live', 'SENT-USDT-SWAP', 'rsi_dip'));
-    assert.equal(g2.check('okx_live', 'SENT-USDT-SWAP', 'supertrend'), null, '旧冷却不会阻止 supertrend');
+    assert.equal(g2.check('okx_live', 'SENT-USDT-SWAP', 'rsi_pullback'), null, '旧冷却不会阻止当前策略');
     assert.equal(g2.list(GUARD_DEFAULTS)[0].strategy_id, 'rsi_dip');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('升级迁移：旧持仓补 strategy_id=rsi_dip / direction=long；isManagedPosition 只认 supertrend；backupOnce 只备份一次且不改原文件', () => {
+test('升级迁移：旧持仓补默认；isManagedPosition 只认 rsi_pullback；backupOnce 只备份一次', () => {
   const old = { instId: 'SENT-USDT-SWAP', posSide: 'net', tp_pct: 8, sl_pct: 6, exec_mode: 'okx_live' };
   assert.equal(needsUpgrade(old), true);
   const n = withStrategyDefaults(old);
   assert.equal(n.strategy_id, 'rsi_dip');
   assert.equal(n.direction, 'long');
   assert.equal(isManagedPosition(n), false);
-  assert.equal(isManagedPosition({ strategy_id: 'supertrend', direction: 'short' }), true);
+  assert.equal(isManagedPosition({ strategy_id: 'rsi_pullback', direction: 'short' }), true);
+  assert.equal(isManagedPosition({ strategy_id: 'supertrend', direction: 'short' }), false);
   assert.equal(needsUpgrade(n), false);
   const dir = mkdtempSync(join(tmpdir(), 'st-bak-'));
   try {
@@ -114,7 +115,7 @@ test('升级迁移：旧持仓补 strategy_id=rsi_dip / direction=long；isManag
   }
 });
 
-test('升级迁移（端到端子进程）：旧 positions.json / cooldowns.json / pnl-ledger.json 加载后补默认，升级前生成 .bak-pre-v2，旧账本首次写盘前备份', () => {
+test('升级迁移（端到端子进程）：positions 升至 v3；冷却与账本保留各自的 v2 备份', () => {
   const dir = mkdtempSync(join(tmpdir(), 'st-mig-'));
   try {
     mkdirSync(join(dir, 'live'), { recursive: true });
@@ -141,13 +142,13 @@ test('升级迁移（端到端子进程）：旧 positions.json / cooldowns.json
     assert.deepEqual(out.live, { s: 'rsi_dip', d: 'long', mode: 'okx_live' });
     assert.equal(out.sim, 'rsi_dip');
     assert.equal(out.trades, 2, '旧账本记录保留，新记录追加');
-    assert.equal(existsSync(join(dir, 'live', 'positions.json.bak-pre-v2')), true);
-    assert.equal(JSON.parse(readFileSync(join(dir, 'live', 'positions.json.bak-pre-v2'), 'utf8')).positions[0].algoId, 'A1', '备份是升级前的原文');
-    assert.equal(existsSync(join(dir, 'positions.json.bak-pre-v2')), true);
-    assert.equal(existsSync(join(dir, 'cooldowns.json.bak-pre-v2')), true);
+    assert.equal(existsSync(join(dir, 'live', 'positions.json.bak-pre-v3')), true);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'live', 'positions.json.bak-pre-v3'), 'utf8')).positions[0].algoId, 'A1', '备份是升级前的原文');
+    assert.equal(existsSync(join(dir, 'positions.json.bak-pre-v3')), true);
+    assert.equal(existsSync(join(dir, 'cooldowns.json')), true, '冷却文件保留');
     assert.equal(readFileSync(join(dir, 'pnl-ledger.json.bak-pre-v2'), 'utf8'), ledger, '账本在首次写盘前备份');
     const after = JSON.parse(readFileSync(join(dir, 'live', 'positions.json'), 'utf8'));
-    assert.equal(after.schema_version, 2);
+    assert.equal(after.schema_version, 3);
     assert.equal(after.positions[0].strategy_id, 'rsi_dip');
     assert.equal(after.has_short, false);
   } finally {

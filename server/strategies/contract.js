@@ -18,10 +18,10 @@
  */
 /**
  * @typedef {Object} Strategy
- * @property {string}   id            全局唯一，如 'supertrend'（将写入 positions / 账本 / 冷却）
+ * @property {string}   id            全局唯一，如 'rsi_pullback'（将写入 positions / 账本 / 冷却）
  * @property {string}   name          展示名
  * @property {number}   version       逻辑版本；改动信号语义必须 +1
- * @property {Direction[]} directions 该策略可能产生的方向（supertrend: ['long','short']）
+ * @property {Direction[]} directions 该策略可能产生的方向
  * @property {ParamField[]} params    参数声明
  * @property {Array<object>} presets  快速预设（可为空数组）
  * @property {(raw:object)=>object} clamp      参数夹紧并补默认值
@@ -34,14 +34,13 @@
  * @property {'scan'|'recheck'} phase   recheck = 下单前复核
  * @property {object} params            本策略已夹紧的参数
  * @property {{price:number|null, bid:number|null, ask:number|null,
- *             bars:number, barMs:number, lastBarTs:number|null,
- *             st?:{ready:boolean, readyBars:number, trend:(1|-1|null), up:number|null, dn:number|null, atr:number|null,
- *                  flip:{ts:number,dir:'long'|'short',closeAt:number,close:number}|null, trendSince:number|null}}} market
- * @property {{tradable:boolean}} flags tradable=false：例如 okx_demo 下该币模拟盘不存在
+ *             bars:number, barMs:number, lastBarTs:number|null, closedBars:Array<object>}} market
+ * @property {{tradable:boolean, heldDirection?:Direction|null}} flags tradable=false：例如 okx_demo 下该币模拟盘不存在
  */
 /**
  * @typedef {Object} Decision
  * @property {Direction|null} direction
+ * @property {'long'|'short'|'flat'|null} target 目标仓位；flat=只平仓，null=保持
  * @property {boolean} signal
  * @property {string}  text
  * @property {{kind:string, reason:string}|null} blocked
@@ -53,6 +52,7 @@
  */
 
 const DIRECTIONS = new Set(['long', 'short']);
+const TARGETS = new Set(['long', 'short', 'flat']);
 
 /**
  * 校验策略定义；不合法抛 Error（中文）
@@ -94,11 +94,12 @@ export function validateDecision(d, strategy) {
   };
   if (!d || typeof d !== 'object') bad('必须是对象');
   if (d.direction !== null && !DIRECTIONS.has(d.direction)) bad('direction 必须是 long/short/null');
+  if (d.target !== undefined && d.target !== null && !TARGETS.has(d.target)) bad('target 必须是 long/short/flat/null');
   if (strategy && d.direction !== null && !strategy.directions.includes(d.direction)) {
     bad(`direction=${d.direction} 不在策略 ${strategy.id} 声明的方向内`);
   }
   if (typeof d.signal !== 'boolean') bad('signal 必须是布尔值');
-  if (d.signal && d.direction === null) bad('signal=true 时 direction 不能为 null');
+  if (d.signal && (d.target ?? d.direction) == null) bad('signal=true 时 target 不能为 null');
   if (typeof d.text !== 'string') bad('text 必须是字符串');
   if (d.blocked !== null && d.blocked !== undefined) {
     if (typeof d.blocked !== 'object' || typeof d.blocked.kind !== 'string' || typeof d.blocked.reason !== 'string') {

@@ -5,10 +5,10 @@ type Mode = 'spot' | 'swap';
 type Bar = '1m' | '3m' | '5m' | '15m' | '30m' | '1H' | '2H' | '4H';
 type ExecMode = 'sim' | 'okx_demo' | 'okx_live';
 type SignalFilter = 'all' | 'triggered' | 'watchlist' | 'skipped';
-type SignalSort = 'priority' | 'flip' | 'volume' | 'updated';
+type SignalSort = 'priority' | 'signal' | 'volume' | 'updated';
 type LowerTab = 'positions' | 'history' | 'filtered' | 'logs';
 type SettingsTab = 'strategy' | 'shared';
-type StrategyId = 'supertrend';
+type StrategyId = 'rsi_pullback';
 type Direction = 'long' | 'short';
 type PresetId = 'conservative' | 'balanced' | 'aggressive';
 
@@ -16,12 +16,23 @@ interface FormState {
   strategy: StrategyId;
   amount: string;
   bar: Bar;
+  rsi_period: string;
+  ema_period: string;
+  long_setup_rsi: string;
+  long_entry_rsi: string;
+  short_setup_rsi: string;
+  short_entry_rsi: string;
+  setup_lookback: string;
+  exit_long_rsi: string;
+  exit_short_rsi: string;
+  volume_filter_enabled: boolean;
+  volume_period: string;
+  volume_multiplier: string;
   atr_period: string;
-  atr_multiplier: string;
-  atr_method: 'rma' | 'sma';
-  disaster_stop_pct: string;
+  atr_stop_mult: string;
+  trend_exit_enabled: boolean;
+  rsi_exit_enabled: boolean;
   allow_short: boolean;
-  flip_only: boolean;
   disaster_cooldown_minutes: string;
   signal_max_age_sec: string;
   sim_fee_pct: string;
@@ -45,19 +56,22 @@ interface SignalRow {
   instId: string;
   volUsd24h: number;
   price: number | null;
-  /** SuperTrend 当前趋势：1 上升 / -1 下降 / null 预热中 */
-  trend?: 1 | -1 | null;
-  st_up?: number | null;
-  st_dn?: number | null;
+  /** EMA 趋势 */
+  trend?: 'bull' | 'bear' | 'neutral' | null;
+  rsi?: number | null;
+  previousRsi?: number | null;
+  ema?: number | null;
   atr?: number | null;
+  volumeRatio?: number | null;
+  volumeOk?: boolean | null;
   readyBars?: number;
-  /** 最近一次（本次运行内记为信号的）翻转：方向与 K 线收盘时间 */
-  flipDir?: Direction | null;
-  flipAt?: string | null;
+  requiredBars?: number;
+  signalKind?: string | null;
+  signalAt?: string | null;
   direction?: Direction | null;
+  target?: Direction | 'flat' | null;
   held?: { direction: Direction; strategy_id: string } | null;
   strategy_id?: string;
-  enterByTrend?: boolean;
   signal: boolean;
   signalText?: string;
   ok?: boolean;
@@ -173,7 +187,7 @@ interface LiveCheckResult {
     max_positions: number;
     daily_loss_limit_usdt: number;
     max_orders_per_hour: number;
-    disaster_stop_pct: number;
+    atr_stop_mult: number;
     allow_short: boolean;
     short_blocked?: string | null;
   };
@@ -294,15 +308,26 @@ interface PnLDashboard {
 }
 
 const DEFAULTS: FormState = {
-  strategy: 'supertrend',
+  strategy: 'rsi_pullback',
   amount: '100',
   bar: '15m',
-  atr_period: '10',
-  atr_multiplier: '3',
-  atr_method: 'rma',
-  disaster_stop_pct: '8',
+  rsi_period: '14',
+  ema_period: '200',
+  long_setup_rsi: '35',
+  long_entry_rsi: '40',
+  short_setup_rsi: '65',
+  short_entry_rsi: '60',
+  setup_lookback: '12',
+  exit_long_rsi: '65',
+  exit_short_rsi: '35',
+  volume_filter_enabled: true,
+  volume_period: '20',
+  volume_multiplier: '1',
+  atr_period: '14',
+  atr_stop_mult: '2.5',
+  trend_exit_enabled: true,
+  rsi_exit_enabled: true,
   allow_short: false,
-  flip_only: true,
   disaster_cooldown_minutes: '60',
   signal_max_age_sec: '300',
   sim_fee_pct: '0.05',
@@ -357,77 +382,71 @@ interface StrategyDef {
   presets: StrategyPreset[];
 }
 
-const SUPERTREND: StrategyDef = {
-  id: 'supertrend',
-  name: 'SuperTrend 翻转反手',
-  tagline: '趋势翻转即平仓并反手，始终持仓（多空双向）',
-  tags: ['趋势跟随', '多空双向', '翻转反手'],
+const RSI_PULLBACK: StrategyDef = {
+  id: 'rsi_pullback',
+  name: 'RSI 趋势回调',
+  tagline: '顺 EMA 趋势，等待 RSI 超调后恢复，量能确认入场',
+  tags: ['RSI 回调', '趋势过滤', '量能确认'],
   summary: (f) =>
-    `ATR(${f.atr_period}, ${f.atr_method.toUpperCase()}) × ${f.atr_multiplier} · ${f.bar} · 灾难止损 ${Number(f.disaster_stop_pct) > 0 ? `${f.disaster_stop_pct}%` : '关闭'} · ${f.allow_short ? '允许做空' : '只做多'}`,
+    `RSI(${f.rsi_period}) · EMA(${f.ema_period}) · ${f.bar} · ATR 止损 ${f.atr_stop_mult}× · ${f.allow_short ? '允许做空' : '只做多'}`,
   fields: [
     {
       key: 'bar',
       label: 'K线周期 bar',
-      hint: '只在已收盘 K 线上判定翻转',
+      hint: '所有指标与信号只使用已收盘 K 线',
       control: { kind: 'select', options: BARS.map((b) => ({ value: b, label: b })) },
     },
-    { key: 'atr_period', label: 'ATR 周期', control: { kind: 'number', min: 1, max: 100, step: 1 } },
-    { key: 'atr_multiplier', label: 'ATR 倍数', control: { kind: 'number', min: 0.1, max: 20, step: 0.1 } },
+    { key: 'rsi_period', label: 'RSI 周期', control: { kind: 'number', min: 2, max: 100, step: 1 } },
+    { key: 'ema_period', label: 'EMA 趋势周期', hint: '价格在 EMA 上方只找多，在下方只找空', control: { kind: 'number', min: 20, max: 500, step: 1 } },
+    { key: 'long_setup_rsi', label: '多头超卖阈值', hint: '回看窗口内 RSI 至少一次低于该值', control: { kind: 'number', min: 5, max: 49, step: 1 } },
+    { key: 'long_entry_rsi', label: '多头恢复阈值', hint: 'RSI 从下向上穿越该值才入场', control: { kind: 'number', min: 6, max: 60, step: 1 } },
+    { key: 'short_setup_rsi', label: '空头超买阈值', hint: '回看窗口内 RSI 至少一次高于该值', control: { kind: 'number', min: 51, max: 95, step: 1 }, advanced: true },
+    { key: 'short_entry_rsi', label: '空头恢复阈值', hint: 'RSI 从上向下穿越该值才入场', control: { kind: 'number', min: 40, max: 94, step: 1 }, advanced: true },
+    { key: 'setup_lookback', label: '超调回看根数', control: { kind: 'number', min: 2, max: 100, step: 1 }, advanced: true },
     {
-      key: 'atr_method',
-      label: 'ATR 方法',
-      hint: 'RMA = Pine 默认 atr()；SMA = 简单移动平均 TR',
-      control: {
-        kind: 'select',
-        options: [
-          { value: 'rma', label: 'RMA（默认）' },
-          { value: 'sma', label: 'SMA' },
-        ],
-      },
+      key: 'volume_filter_enabled',
+      label: '成交量确认',
+      hint: '当前收盘柱成交量达到此前均量倍数，减少无量反弹假信号',
+      control: { kind: 'switch', text: '入场必须通过成交量确认' },
     },
-    {
-      key: 'disaster_stop_pct',
-      label: '灾难止损 %',
-      hint: '入场价反向 N% 的兜底止损（防断线 / 极端行情）；0 = 关闭。正常出场靠信号翻转',
-      control: { kind: 'number', min: 0, max: 50, step: 0.5 },
-    },
+    { key: 'volume_period', label: '均量周期', control: { kind: 'number', min: 2, max: 200, step: 1 }, advanced: true },
+    { key: 'volume_multiplier', label: '成交量倍数', control: { kind: 'number', min: 0.1, max: 10, step: 0.1 }, advanced: true },
+    { key: 'atr_period', label: 'ATR 周期', control: { kind: 'number', min: 2, max: 100, step: 1 }, advanced: true },
+    { key: 'atr_stop_mult', label: 'ATR 灾难止损倍数', hint: '入场时按 ATR × 倍数换算为止损距离；0 = 关闭', control: { kind: 'number', min: 0, max: 20, step: 0.1 } },
+    { key: 'exit_long_rsi', label: '多单 RSI 退出', control: { kind: 'number', min: 1, max: 95, step: 1 }, advanced: true },
+    { key: 'exit_short_rsi', label: '空单 RSI 退出', control: { kind: 'number', min: 5, max: 99, step: 1 }, advanced: true },
+    { key: 'trend_exit_enabled', label: 'EMA 反转退出', control: { kind: 'switch', text: '收盘价穿越 EMA 反向时平仓' }, advanced: true },
+    { key: 'rsi_exit_enabled', label: 'RSI 目标退出', control: { kind: 'switch', text: 'RSI 到达目标区时平仓' }, advanced: true },
     {
       key: 'allow_short',
       label: '允许做空',
-      hint: '仅永续。还需服务端环境变量 RSI_ALLOW_SHORT=1（实盘另需 RSI_ALLOW_SHORT_LIVE=1），否则只做多；做空被拦时持多遇卖出翻转仍会平仓',
-      control: { kind: 'switch', text: '卖出翻转时开空 / 反手' },
-    },
-    {
-      key: 'flip_only',
-      label: '仅翻转入场',
-      hint: '勾选：只在翻转出现时入场（启动时不按当前趋势入场）；取消：无仓位时按当前趋势入场',
-      advanced: true,
-      control: { kind: 'switch', text: '只在翻转信号出现时入场' },
+      hint: '仅永续；还需服务端 RSI_ALLOW_SHORT=1，实盘另需 RSI_ALLOW_SHORT_LIVE=1',
+      control: { kind: 'switch', text: '允许在空头趋势做空' },
     },
   ],
   presets: [
     {
       id: 'conservative',
       label: '保守',
-      desc: '1 小时周期，ATR(10) × 3：信号少、更稳',
-      values: { bar: '1H', atr_period: '10', atr_multiplier: '3', atr_method: 'rma', disaster_stop_pct: '8' },
+      desc: '1 小时周期，更深超调并要求 1.2 倍量能',
+      values: { bar: '1H', long_setup_rsi: '30', long_entry_rsi: '38', short_setup_rsi: '70', short_entry_rsi: '62', volume_multiplier: '1.2', atr_stop_mult: '2' },
     },
     {
       id: 'balanced',
       label: '均衡',
-      desc: '默认参数：15 分钟周期，ATR(10) × 3',
-      values: { bar: '15m', atr_period: '10', atr_multiplier: '3', atr_method: 'rma', disaster_stop_pct: '8' },
+      desc: '默认：15 分钟，35→40 / 65→60，均量确认',
+      values: { bar: '15m', long_setup_rsi: '35', long_entry_rsi: '40', short_setup_rsi: '65', short_entry_rsi: '60', volume_multiplier: '1', atr_stop_mult: '2.5' },
     },
     {
       id: 'aggressive',
       label: '激进',
-      desc: '15 分钟周期，ATR(7) × 2：翻转更频繁、噪音也多',
-      values: { bar: '15m', atr_period: '7', atr_multiplier: '2', atr_method: 'rma', disaster_stop_pct: '8' },
+      desc: '5 分钟周期，较浅回调，信号更多、噪音更高',
+      values: { bar: '5m', long_setup_rsi: '38', long_entry_rsi: '43', short_setup_rsi: '62', short_entry_rsi: '57', volume_multiplier: '0.8', atr_stop_mult: '3' },
     },
   ],
 };
 
-const STRATEGIES: StrategyDef[] = [SUPERTREND];
+const STRATEGIES: StrategyDef[] = [RSI_PULLBACK];
 
 function getStrategy(id: StrategyId): StrategyDef {
   return STRATEGIES.find((s) => s.id === id) || STRATEGIES[0];
@@ -443,8 +462,8 @@ const LIVE_FORM_DEFAULTS: Partial<FormState> = {
 };
 /** 按执行方式分开保存的字段 */
 const MODE_FIELDS: (keyof FormState)[] = ['amount', 'leverage', 'max_positions', 'daily_loss_limit_usdt', 'max_orders_per_hour'];
-const MODE_CFG_KEY = (m: ExecMode) => `supertrend-trader:mode-cfg:${m}`;
-const SETTINGS_KEY = 'supertrend-trader:strategy-settings';
+const MODE_CFG_KEY = (m: ExecMode) => `rsi-pullback-trader:mode-cfg:${m}`;
+const SETTINGS_KEY = 'rsi-pullback-trader:strategy-settings';
 const LIVE_CONFIRM_TEXT = '确认实盘';
 const SHORT_CONFIRM_TEXT = '确认做空';
 
@@ -460,11 +479,11 @@ function loadSavedSettings(): StoredSettings {
       const parsed = JSON.parse(raw) as Partial<StoredSettings>;
       if (parsed.form && typeof parsed.form === 'object') {
         return {
-          // 只取当前表单已有的键（旧 RSI 版本保存的字段一律丢弃），策略固定为 SuperTrend
+          // 只取当前表单已有的键，淘汰策略保存的字段不会进入新配置。
           form: {
             ...DEFAULTS,
             ...Object.fromEntries(Object.entries(parsed.form).filter(([k]) => k in DEFAULTS)),
-            strategy: 'supertrend',
+            strategy: 'rsi_pullback',
           } as FormState,
           savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : '',
         };
@@ -506,6 +525,7 @@ function isExchangeMode(m?: string | null) {
 }
 
 const ACTION_TEXT: Record<string, string> = {
+  signal: '策略信号平仓',
   flip: '信号反手/平仓',
   tp: '止盈',
   sl: '灾难止损',
@@ -524,10 +544,10 @@ function fmtPrice(n: number | null | undefined) {
 }
 
 const DIR_TEXT: Record<string, string> = { long: '多', short: '空' };
-const STRATEGY_TEXT: Record<string, string> = { supertrend: 'SuperTrend', rsi_dip: '旧·RSI抄底' };
+const STRATEGY_TEXT: Record<string, string> = { rsi_pullback: 'RSI 回调', supertrend: '旧·SuperTrend', rsi_dip: '旧·RSI抄底' };
 
-function trendText(t: number | null | undefined) {
-  return t === 1 ? '↑ 上升' : t === -1 ? '↓ 下降' : '预热中';
+function trendText(t: SignalRow['trend']) {
+  return t === 'bull' ? '↑ 多头' : t === 'bear' ? '↓ 空头' : t === 'neutral' ? '中性' : '预热中';
 }
 
 function fmtVol(n: number | null | undefined) {
@@ -580,8 +600,8 @@ function signalState(s: SignalRow) {
   return { label: '观察中', tone: 'neutral', detail: s.signalText || '' };
 }
 
-function trendTone(t: number | null | undefined) {
-  return t === 1 ? 'up' : t === -1 ? 'down' : 'invalid';
+function trendTone(t: SignalRow['trend']) {
+  return t === 'bull' ? 'up' : t === 'bear' ? 'down' : 'invalid';
 }
 
 let sessionTokenPromise: Promise<string> | null = null;
@@ -988,12 +1008,23 @@ export default function App() {
     return {
       amount: Number(form.amount),
       bar: form.bar,
+      rsi_period: Number(form.rsi_period),
+      ema_period: Number(form.ema_period),
+      long_setup_rsi: Number(form.long_setup_rsi),
+      long_entry_rsi: Number(form.long_entry_rsi),
+      short_setup_rsi: Number(form.short_setup_rsi),
+      short_entry_rsi: Number(form.short_entry_rsi),
+      setup_lookback: Number(form.setup_lookback),
+      exit_long_rsi: Number(form.exit_long_rsi),
+      exit_short_rsi: Number(form.exit_short_rsi),
+      volume_filter_enabled: form.volume_filter_enabled,
+      volume_period: Number(form.volume_period),
+      volume_multiplier: Number(form.volume_multiplier),
       atr_period: Number(form.atr_period),
-      atr_multiplier: Number(form.atr_multiplier),
-      atr_method: form.atr_method,
-      disaster_stop_pct: Number(form.disaster_stop_pct),
+      atr_stop_mult: Number(form.atr_stop_mult),
+      trend_exit_enabled: form.trend_exit_enabled,
+      rsi_exit_enabled: form.rsi_exit_enabled,
       allow_short: form.mode === 'swap' && form.allow_short === true,
-      flip_only: form.flip_only !== false,
       disaster_cooldown_minutes: Number(form.disaster_cooldown_minutes),
       signal_max_age_sec: Number(form.signal_max_age_sec),
       sim_fee_pct: Number(form.sim_fee_pct),
@@ -1113,7 +1144,7 @@ export default function App() {
       totalPnl != null && Number.isFinite(totalPnl)
         ? ` · ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}U`
         : '';
-    document.title = `${head}${money} · SuperTrend 翻转交易`;
+    document.title = `${head}${money} · RSI 趋势回调交易`;
     paintFavicon(
       offline
         ? '#f59e0b'
@@ -1304,7 +1335,7 @@ export default function App() {
       ) : (
         <>
           <p>将停止扫描并禁止开新仓。</p>
-          <p className="dim">已有持仓保留，模拟盘 / 实盘持仓仍由交易所保护单（灾难止损）保护；但不再随信号反手。</p>
+          <p className="dim">已有持仓保留，模拟盘 / 实盘持仓仍由交易所 ATR 灾难止损保护；停止后不再执行新的 RSI 信号。</p>
         </>
       ),
     });
@@ -1391,14 +1422,14 @@ export default function App() {
       if (signalFilter === 'skipped') return !!(s.skipped || s.filtered || s.notOnDemo);
       return true;
     });
-    const flipTime = (s: SignalRow) => (s.flipAt ? new Date(s.flipAt).getTime() : 0);
+    const signalTime = (s: SignalRow) => (s.signalAt ? new Date(s.signalAt).getTime() : 0);
     const priority = (s: SignalRow) =>
       s.signal && !s.skipped ? 0 : s.submitting ? 1 : s.skipped ? 2 : s.watchlist ? 3 : s.filtered || s.notOnDemo ? 5 : 4;
     return [...result].sort((a, b) => {
-      if (signalSort === 'flip') return flipTime(b) - flipTime(a);
+      if (signalSort === 'signal') return signalTime(b) - signalTime(a);
       if (signalSort === 'volume') return (b.volUsd24h || 0) - (a.volUsd24h || 0);
       if (signalSort === 'updated') return new Date(b.at || 0).getTime() - new Date(a.at || 0).getTime();
-      return priority(a) - priority(b) || flipTime(b) - flipTime(a);
+      return priority(a) - priority(b) || signalTime(b) - signalTime(a);
     });
   }, [signals, signalFilter, signalQuery, signalSort]);
 
@@ -1407,13 +1438,13 @@ export default function App() {
       <header className="header">
         <div className="brand">
           <h1>
-            <span className="accent">SuperTrend 翻转交易</span>
+            <span className="accent">RSI 趋势回调交易</span>
             <span style={{ color: 'var(--text-dim)', fontWeight: 500, fontSize: '1rem' }}>
               · 交易监控台
             </span>
           </h1>
           <div className="subtitle">
-            SuperTrend 翻转反手 · 多空双向 · OKX WebSocket 实时行情 · 模拟与实盘分级执行
+            EMA 趋势过滤 · RSI 回调恢复 · 成交量确认 · ATR 动态风控
           </div>
         </div>
         <div className="header-controls">
@@ -1691,7 +1722,7 @@ export default function App() {
             <div className="signal-banner">
               {scan.note ||
                 (running
-                  ? `WebSocket 推送中 · SuperTrend(${runCfgNum('atr_period', form.atr_period)}, ${runCfgNum('atr_multiplier', form.atr_multiplier)}) · ${form.mode} · K线订阅 ${scan.ws?.candleSubs ?? 0}`
+                        ? `WebSocket 推送中 · RSI(${runCfgNum('rsi_period', form.rsi_period)}) + EMA(${runCfgNum('ema_period', form.ema_period)}) · ${form.mode} · K线订阅 ${scan.ws?.candleSubs ?? 0}`
                   : '选择 mode → 设置成交量/数量上限 → 点击「开始全市场扫描」（REST 预热 + WS 推送）')}
             </div>
             {scan.lastScanAt && (
@@ -1925,7 +1956,7 @@ export default function App() {
                         </button>
                       </div>
                       <div className="hint">
-                        下单后立即在交易所挂灾难止损（conditional 算法单，全仓平仓，程序崩溃也受保护）；正常出场靠 SuperTrend 翻转，盈亏为真实已实现（含手续费）。做空 / 反手路径尚未经真实环境验证，请先在 OKX 模拟盘小额试跑。
+                        下单后立即按入场时 ATR 距离挂灾难止损（conditional 算法单，全仓平仓）；正常出场使用 RSI 目标区或 EMA 趋势反转。请先在 OKX 模拟盘小额试跑。
                         {form.exec_mode === 'okx_live' ? ' 实盘要求：Key 只开读取+交易（不开提现）、绑定 IP；账户模式为合约模式、持仓模式为买卖模式。' : ''}
                       </div>
                     </div>
@@ -1984,7 +2015,7 @@ export default function App() {
                 value={form.signal_max_age_sec}
                 onChange={(e) => setField('signal_max_age_sec', e.target.value)}
               />
-              <div className="hint">翻转超过此时间才被处理时，只平仓、不入场 / 不反手，默认 300</div>
+              <div className="hint">入场信号超过此时间才被处理时不追单；平仓信号不受限制，默认 300</div>
             </div>
             <div className="field">
               <label>风控：单日亏损上限 USDT</label>
@@ -2246,7 +2277,7 @@ export default function App() {
             <span>排序</span>
             <select value={signalSort} onChange={(e) => setSignalSort(e.target.value as SignalSort)}>
               <option value="priority">信号优先</option>
-              <option value="flip">最近翻转</option>
+              <option value="signal">最近信号</option>
               <option value="volume">成交额从高到低</option>
               <option value="updated">最近更新</option>
             </select>
@@ -2259,7 +2290,7 @@ export default function App() {
                 <th>交易对</th>
                 <th>24h成交额</th>
                 <th>价格</th>
-                <th>趋势 / 最近翻转</th>
+                <th>EMA 趋势 / RSI</th>
                 <th>持仓</th>
                 <th>信号</th>
                 <th>更新时间</th>
@@ -2297,11 +2328,10 @@ export default function App() {
                     <td className="mono">
                       <span className={`rsi-chip ${trendTone(s.trend)}`}>{trendText(s.trend)}</span>
                       {s.stale ? <span className="tag">数据断档</span> : null}
-                      {s.flipAt ? (
-                        <div className="table-meta" title={localTs(s.flipAt)}>
-                          {s.flipDir ? `${s.flipDir === 'long' ? '买入' : '卖出'}翻转 ` : ''}{relativeTs(s.flipAt)}
-                        </div>
-                      ) : null}
+                      <div className="table-meta">
+                        RSI {s.rsi == null ? '—' : s.rsi.toFixed(1)} · EMA {fmtPrice(s.ema)}
+                        {s.volumeRatio != null ? ` · 量 ${s.volumeRatio.toFixed(2)}×` : ''}
+                      </div>
                     </td>
                     <td>
                       {s.held ? (
@@ -2383,9 +2413,9 @@ export default function App() {
                       <strong className="mono">{fmtVol(s.volUsd24h)}</strong>
                     </div>
                   </div>
-                  {(state.detail || s.flipAt) && (
+                  {(state.detail || s.signalAt) && (
                     <div className="signal-card-detail">
-                      {state.detail || `${s.flipDir === 'long' ? '买入' : '卖出'}翻转 ${relativeTs(s.flipAt)}`}
+                      {state.detail || `RSI ${s.rsi == null ? '—' : s.rsi.toFixed(1)} · ${relativeTs(s.signalAt)}`}
                     </div>
                   )}
                   <div className="signal-card-foot">
@@ -2471,7 +2501,7 @@ export default function App() {
                           <span className="mono">
                             {p.instId}{' '}
                             <span className={`dir-badge ${dir}`}>{DIR_TEXT[dir]}</span>
-                            {legacy ? <span className="tag" title="旧策略持仓：SuperTrend 不会开/平/反手，只对账">旧策略·只对账</span> : null}
+                            {legacy ? <span className="tag" title="旧策略持仓：当前 RSI 策略不会开平，只对账">旧策略·只对账</span> : null}
                           </span>
                           <span className="cell-sub">
                             {STRATEGY_TEXT[p.strategy_id || ''] || p.strategy_id || ''}{' · '}
@@ -2618,7 +2648,7 @@ export default function App() {
                         <div className="compact-empty">
                           <span className="empty-icon">⇄</span>
                           <strong>暂无平仓记录</strong>
-                          <span>持仓被信号反手 / 平仓、灾难止损或手动平仓后会显示在这里。</span>
+                          <span>持仓被策略信号、灾难止损或手动平仓后会显示在这里。</span>
                         </div>
                       </td>
                     </tr>
@@ -2873,13 +2903,13 @@ export default function App() {
                       <tr>
                         <td>灾难止损</td>
                         <td className="mono">
-                          {liveModal.check.summary.disaster_stop_pct > 0
-                            ? `${liveModal.check.summary.disaster_stop_pct}%（交易所 conditional 算法单，全仓）`
-                            : '已关闭（仅靠信号反手出场，不建议）'}
+                          {liveModal.check.summary.atr_stop_mult > 0
+                            ? `ATR × ${liveModal.check.summary.atr_stop_mult}（交易所 conditional 算法单，全仓）`
+                            : '已关闭（仅靠策略信号出场，不建议）'}
                         </td>
                       </tr>
                       <tr>
-                        <td>做空 / 反手</td>
+                        <td>做空</td>
                         <td className={`mono ${liveModal.check.summary.allow_short ? 'text-rose' : ''}`}>
                           {liveModal.check.summary.allow_short
                             ? '已开启（真实资金做空，风险高于做多）'
@@ -2965,7 +2995,7 @@ export default function App() {
       <footer className="footer">
         <strong>风险提示：</strong>
         默认本地模拟成交；「OKX 模拟盘」仅调用模拟盘接口（不涉及真实资金）；<strong>「OKX 实盘」使用真实资金</strong>
-        ，需在 server/.env.local 配置实盘 Key、通过启动检查并手动输入「确认实盘」后才会下单；实盘做空另需服务端环境变量 RSI_ALLOW_SHORT=1 与 RSI_ALLOW_SHORT_LIVE=1 并输入「确认做空」。模拟盘成交价可能与 WebSocket 实盘行情略有差异。行情改为 OKX WebSocket 推送 + 本地 SuperTrend 计算；订阅过多会拆多连接并自动重连。SuperTrend 翻转反手在震荡行情中会频繁来回止损（反复被打），做空与反手风险高于做多，默认关闭。本工具仅供学习研究，不构成投资建议，盈亏自负。
+        ，需在 server/.env.local 配置实盘 Key、通过启动检查并手动输入「确认实盘」后才会下单；实盘做空另需服务端环境变量 RSI_ALLOW_SHORT=1 与 RSI_ALLOW_SHORT_LIVE=1 并输入「确认做空」。模拟盘成交价可能与 WebSocket 实盘行情略有差异。行情使用 OKX WebSocket 推送，只在已收盘 K 线上本地计算 RSI、EMA、成交量和 ATR；订阅过多会拆多连接并自动重连。任何量化策略都可能连续亏损，做空风险高于做多且默认关闭。本工具仅供学习研究，不构成投资建议，盈亏自负。
       </footer>
     </div>
   );

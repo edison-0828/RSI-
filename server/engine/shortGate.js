@@ -6,7 +6,7 @@
  *       RSI_ALLOW_SHORT_LIVE=1  实盘（okx_live）另需此项（且需 RSI_ALLOW_SHORT=1）；默认 0
  *  2) 策略设置 allow_short（界面开关）；现货不支持做空
  *  3) 执行层断言：direction==='short' 且被 1 拦截时直接抛错
- * 做空被拦截时：已持多单遇卖出翻转仍会平多（只是不反手开空）。
+ * 做空被拦截时不影响任何已有仓位的退出信号。
  */
 
 /** @returns {{base:boolean, live:boolean}} */

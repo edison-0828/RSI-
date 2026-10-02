@@ -2862,7 +2862,7 @@ body {
   }
 }
 
-/* ── SuperTrend：趋势芯片 / 多空徽章 ── */
+/* ── RSI + EMA：趋势芯片 / 多空徽章 ── */
 .rsi-chip.up,
 .rsi-mobile.up { color: #34d399; }
 .rsi-chip.up {

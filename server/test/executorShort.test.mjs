@@ -56,7 +56,7 @@ test('开空（模拟盘 mock）：side=sell、参考买一价算张数、pos �
   ex.client.placeAlgoOrder = async (body) => { algos.push(body); return [{ algoId: 'A1' }]; };
   const events = [];
   const r = await withEnv({ RSI_ALLOW_SHORT: '1' }, () =>
-    ex.openPosition({ instId: 'BTC-USDT-SWAP', direction: 'short', amount: 100, leverage: 10, tpPct: null, slPct: 8, strategyId: 'supertrend', strategyVersion: 1, signalMeta: { flip_bar_ts: 7 }, maxSpreadPct: 0.5, onPending: (e) => events.push(e), recheck: () => ({ ok: true }) })
+    ex.openPosition({ instId: 'BTC-USDT-SWAP', direction: 'short', amount: 100, leverage: 10, tpPct: null, slPct: 8, strategyId: 'rsi_pullback', strategyVersion: 1, signalMeta: { signal_bar_ts: 7 }, maxSpreadPct: 0.5, onPending: (e) => events.push(e), recheck: () => ({ ok: true }) })
   );
   assert.equal(r.ok, true);
   assert.equal(orders.length, 1);
@@ -68,9 +68,9 @@ test('开空（模拟盘 mock）：side=sell、参考买一价算张数、pos �
   assert.ok(Number(orders[0].sz) >= 1);
   const pos = r.pos;
   assert.equal(pos.direction, 'short');
-  assert.equal(pos.strategy_id, 'supertrend');
+  assert.equal(pos.strategy_id, 'rsi_pullback');
   assert.equal(pos.strategy_version, 1);
-  assert.deepEqual(pos.signal_meta, { flip_bar_ts: 7 });
+  assert.deepEqual(pos.signal_meta, { signal_bar_ts: 7 });
   assert.equal(pos.liq_price, 190);
   assert.equal(pos.take_profit_price, null);
   assert.ok(Math.abs(pos.stop_loss_price - 108) < 1e-6, `空头灾难止损价应在入场价上方 8%：${pos.stop_loss_price}`);
@@ -82,7 +82,7 @@ test('开空（模拟盘 mock）：side=sell、参考买一价算张数、pos �
   assert.equal(algos[0].tpTriggerPx, undefined);
   assert.equal(pos.algoId, 'A1');
   assert.equal(events[0].direction, 'short');
-  assert.equal(events[0].strategy_id, 'supertrend');
+  assert.equal(events[0].strategy_id, 'rsi_pullback');
 });
 
 test('开多（模拟盘 mock）：side=buy、参考卖一价；旧式止盈+止损为 OCO + sell + reduceOnly（旧 RSI 持仓的重挂路径）', async () => {

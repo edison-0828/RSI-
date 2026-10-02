@@ -9,10 +9,10 @@ export { barToMs };
  * @param {object} store CandleStore
  * @param {string} instId
  * @param {object} params 策略已夹紧参数
- * @param {{phase:'scan'|'recheck', price:number|null, tradable:boolean}} opt price 为最终使用的价格
+ * @param {{phase:'scan'|'recheck', price:number|null, tradable:boolean, heldDirection?:'long'|'short'|null}} opt price 为最终使用的价格
  * @returns {object|null} 无快照返回 null
  */
-export function ctxFromStore(store, instId, params, { phase, price, tradable }) {
+export function ctxFromStore(store, instId, params, { phase, price, tradable, heldDirection = null }) {
   const snap = store.snapshot(instId);
   if (!snap) return null;
   return {
@@ -26,9 +26,9 @@ export function ctxFromStore(store, instId, params, { phase, price, tradable }) 
       bars: snap.bars,
       barMs: store.barMs,
       lastBarTs: snap.lastTs,
-      st: snap.st,
+      closedBars: snap.closedBars,
     },
-    flags: { tradable },
+    flags: { tradable, heldDirection },
   };
 }
 

@@ -1,9 +1,9 @@
 /**
  * 策略注册表：registerStrategy / getStrategy / listStrategies
- * 内置策略在模块加载时注册（目前只有 supertrend）。
+ * 内置策略在模块加载时注册（目前只有 RSI 趋势回调）。
  */
 import { validateStrategy } from './contract.js';
-import superTrend from './superTrend.js';
+import rsiPullback from './rsiPullback.js';
 
 /** @type {Map<string, import('./contract.js').Strategy>} */
 const registry = new Map();
@@ -45,6 +45,6 @@ export function evaluateSafely(strategy, ctx, onError) {
   }
 }
 
-registerStrategy(superTrend); // 默认且唯一启用的策略（RSI 抄底已移除）
+registerStrategy(rsiPullback);
 
 export default { registerStrategy, getStrategy, listStrategies, evaluateSafely };

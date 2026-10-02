@@ -109,7 +109,7 @@ function riskEventsOf(execMode) {
 /**
  * @param {object} pos 持仓（direction: long|short；strategy_id）
  * @param {number} exitPrice
- * @param {'tp'|'sl'|'flip'|'manual'|'kill'|'failsafe'|'liq'|'external'} action  flip=SuperTrend 信号反手/平仓
+ * @param {'tp'|'sl'|'signal'|'flip'|'manual'|'kill'|'failsafe'|'liq'|'external'} action  signal=当前策略信号平仓；flip=旧版兼容
  * @param {number} profitPct 方向调整后的价格收益率 %（空头价格下跌为正）
  * @param {object} [extra] 真实成交数据（OKX 模拟盘/实盘）：
  *   { pnl_usdt 已实现盈亏(含手续费/资金费), fee_usdt, funding_fee_usdt, gross_pnl_usdt, estimated, inferred, contracts }

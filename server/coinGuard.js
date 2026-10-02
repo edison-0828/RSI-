@@ -182,7 +182,7 @@ export class CoinGuard {
   }
 
   /**
-   * 信号出场策略（SuperTrend）专用：灾难止损触发 / 强平后，该币对该策略冷却 minutes 分钟（信号平仓不冷却）。
+   * 信号出场策略专用：灾难止损 / 强平后，该币对该策略冷却 minutes 分钟（正常策略平仓不冷却）。
    * 已有更长的冷却不会被缩短。minutes<=0 表示不冷却。
    * @returns {{kind:string, until:number, reason:string}|null}
    */

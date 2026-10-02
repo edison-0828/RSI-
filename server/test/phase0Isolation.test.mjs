@@ -111,7 +111,7 @@ test('隔离变量下 import index.js：不监听端口、进程自行退出、�
   }
 });
 
-test('冒烟（sim，无网络）：bootstrap 历史翻转不算信号；新收盘的买入翻转 → 开多；旧持仓不被管理；clamp 与策略 clamp 一致', () => {
+test('冒烟（sim，无网络）：bootstrap 只预热；新收盘 RSI 回调恢复 → 开多；旧持仓不被管理；clamp 一致', () => {
   const dir = mkdtempSync(join(tmpdir(), 'rsi-smoke-'));
   try {
     writeFileSync(
@@ -123,19 +123,19 @@ test('冒烟（sim，无网络）：bootstrap 历史翻转不算信号；新收�
     const r = runChild({ RSI_NO_LISTEN: '1', RSI_DATA_DIR: dir, RSI_NO_ENV_LOCAL: '1', PORT: String(port) });
     assert.equal(r.status, 0, r.stderr);
     const o = r.out;
-    assert.deepEqual(o.cfg, { atr_period: 10, atr_multiplier: 3, atr_method: 'rma', allow_short: false, flip_only: true });
-    assert.deepEqual(o.afterBootstrap.signals, [], '启动 bootstrap 里的历史翻转不算信号');
-    assert.deepEqual(o.afterBootstrap.positions, ['ZZZ-USDT-SWAP'], '启动时不会按当前趋势入场（flip_only）');
+    assert.deepEqual(o.cfg, { rsi_period: 14, ema_period: 20, atr_period: 14, atr_stop_mult: 2.5, allow_short: false });
+    assert.deepEqual(o.afterBootstrap.signals, [], 'bootstrap 仅预热，不重放历史信号');
+    assert.deepEqual(o.afterBootstrap.positions, ['ZZZ-USDT-SWAP']);
     const aaa = o.positionsAfter.find((p) => p.instId === 'AAA-USDT-SWAP');
-    assert.ok(aaa, 'bar 164 买入翻转后应开多');
+    assert.ok(aaa, 'RSI 从超卖区恢复并通过 EMA/量能确认后应开多');
     assert.equal(aaa.direction, 'long');
-    assert.equal(aaa.strategy_id, 'supertrend');
+    assert.equal(aaa.strategy_id, 'rsi_pullback');
     assert.equal(aaa.exec_mode, 'sim');
     assert.equal(aaa.tp, null, '无止盈');
-    assert.ok(Math.abs(aaa.sl - aaa.entry * 0.92) < 1e-9, '灾难止损 8%');
-    assert.equal(o.positionsAfter.some((p) => p.instId === 'BBB-USDT-SWAP'), false, '无翻转的币不开仓');
+    assert.ok(aaa.sl < aaa.entry, '多单 ATR 灾难止损应位于入场价下方');
+    assert.ok(aaa.slPct > 0, '止损百分比由 ATR 动态计算');
     const legacy = o.positionsAfter.find((p) => p.instId === 'ZZZ-USDT-SWAP');
-    assert.equal(legacy.strategy_id, 'rsi_dip', '旧持仓不被 SuperTrend 接管或平仓');
+    assert.equal(legacy.strategy_id, 'rsi_dip', '旧持仓不被当前 RSI 策略接管或平仓');
     assert.deepEqual(o.clampMismatch, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });

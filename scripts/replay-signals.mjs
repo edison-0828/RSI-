@@ -1,87 +1,72 @@
 #!/usr/bin/env node
-// SuperTrend 翻转回放：读 K 线文件 → 按币输出翻转序列（JSONL，一行一个翻转）。只读文件，不联网、不下单、不碰 server/data。
-//
-// 用法：
-//   node scripts/replay-signals.mjs --file <K线文件> [--coin BTC-USDT-SWAP] [--period 10] [--mult 3] [--method rma|sma] [--limit 700]
-// 支持的文件格式：
-//   1) 缓存字典：{ "<ts>": [ts,o,h,l,c,vol,volCcy,confirm], ... }（单币；--coin 仅作标注）
-//   2) 测试 fixture（server/test/fixtures/supertrend/python_ref.json）：{ coins: { inst: { ts,h,l,c } } }，可用 --coin 选币
-//   3) OKX REST 返回数组：[[ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm], ...]（最新在前）
-// 输出每行：{"coin","i","ts","time","dir":"long|short","signal":"buy|sell","close","atr","up","dn"}；末尾一行汇总 { "summary": ... }（输出到 stderr）
+// RSI 趋势回调信号回放。只读本地 K 线文件，不联网、不下单、不触碰 server/data。
 import { readFileSync } from 'node:fs';
-import { superTrend } from '../server/engine/superTrendCalc.js';
+import rsiPullback from '../server/strategies/rsiPullback.js';
 
 const args = process.argv.slice(2);
-const opt = (k, d) => {
-  const i = args.indexOf(`--${k}`);
-  return i >= 0 && i + 1 < args.length ? args[i + 1] : d;
+const opt = (key, fallback) => {
+  const index = args.indexOf(`--${key}`);
+  return index >= 0 && index + 1 < args.length ? args[index + 1] : fallback;
 };
 if (args.includes('--help') || args.includes('-h') || !opt('file')) {
-  console.error('用法：node scripts/replay-signals.mjs --file <K线文件> [--coin <instId>] [--period 10] [--mult 3] [--method rma|sma] [--limit N]');
+  console.error('用法：node scripts/replay-signals.mjs --file <K线文件> [--coin BTC-USDT-SWAP] [--bar 15m] [--rsi 14] [--ema 200] [--volume-mult 1] [--limit 700]');
   process.exit(opt('file') ? 0 : 2);
 }
-const period = Number(opt('period', 10));
-const mult = Number(opt('mult', 3));
-const method = String(opt('method', 'rma')).toLowerCase() === 'sma' ? 'sma' : 'rma';
+
+const coin = opt('coin', 'UNKNOWN');
+const bar = opt('bar', '15m');
+const barMs = { '1m': 60_000, '3m': 180_000, '5m': 300_000, '15m': 900_000, '30m': 1_800_000, '1H': 3_600_000, '2H': 7_200_000, '4H': 14_400_000 }[bar] || 900_000;
+const params = rsiPullback.clamp({
+  bar,
+  rsi_period: Number(opt('rsi', 14)),
+  ema_period: Number(opt('ema', 200)),
+  volume_multiplier: Number(opt('volume-mult', 1)),
+  allow_short: true,
+});
 const limit = Number(opt('limit', 0));
-const coinArg = opt('coin', null);
 const raw = JSON.parse(readFileSync(opt('file'), 'utf8'));
 
-/** 统一成 { coin -> {ts,h,l,c} }（升序，仅已收盘） */
-function load() {
-  const out = {};
-  const fromRows = (rows) => {
-    const r = rows
-      .filter((x) => String(x[x.length - 1] ?? '1') !== '0')
-      .map((x) => ({ ts: Number(x[0]), h: Number(x[2]), l: Number(x[3]), c: Number(x[4]) }))
-      .filter((b) => [b.ts, b.h, b.l, b.c].every(Number.isFinite))
-      .sort((a, b) => a.ts - b.ts);
-    return { ts: r.map((b) => b.ts), h: r.map((b) => b.h), l: r.map((b) => b.l), c: r.map((b) => b.c) };
+function toBar(row) {
+  const quoteVolume = Number(row[7]);
+  const baseVolume = Number(row[5]);
+  return {
+    ts: Number(row[0]), o: Number(row[1]), h: Number(row[2]), l: Number(row[3]), c: Number(row[4]),
+    v: Number.isFinite(quoteVolume) ? quoteVolume : (Number.isFinite(baseVolume) ? baseVolume : 0),
   };
-  if (raw && raw.coins) {
-    for (const [k, v] of Object.entries(raw.coins)) out[k] = { ts: v.ts, h: v.h, l: v.l, c: v.c };
-  } else if (Array.isArray(raw)) {
-    out[coinArg || 'UNKNOWN'] = fromRows(raw);
-  } else if (raw && typeof raw === 'object') {
-    out[coinArg || 'UNKNOWN'] = fromRows(Object.values(raw));
-  }
-  return out;
 }
 
-const all = load();
-const coins = coinArg && all[coinArg] ? [coinArg] : Object.keys(all);
-if (!coins.length) {
-  console.error('文件里没有可用的 K 线');
+let rows = Array.isArray(raw) ? raw : Object.values(raw || {});
+let bars = rows
+  .filter((row) => Array.isArray(row) && String(row[8] ?? '1') !== '0')
+  .map(toBar)
+  .filter((item) => [item.ts, item.o, item.h, item.l, item.c].every(Number.isFinite))
+  .sort((a, b) => a.ts - b.ts);
+if (limit > 0 && bars.length > limit) bars = bars.slice(-limit);
+if (!bars.length) {
+  console.error('文件里没有可用的已收盘 K 线');
   process.exit(2);
 }
-const summary = {};
-for (const coin of coins) {
-  let { ts, h, l, c } = all[coin];
-  if (limit > 0 && c.length > limit) {
-    const s = c.length - limit;
-    ts = ts.slice(s); h = h.slice(s); l = l.slice(s); c = c.slice(s);
-  }
-  const r = superTrend(h, l, c, { period, mult, method });
-  let buys = 0;
-  let sells = 0;
-  for (let i = 0; i < c.length; i++) {
-    if (!r.buy[i] && !r.sell[i]) continue;
-    r.buy[i] ? buys++ : sells++;
-    console.log(
-      JSON.stringify({
-        coin,
-        i,
-        ts: ts[i],
-        time: new Date(ts[i]).toISOString(),
-        dir: r.buy[i] ? 'long' : 'short',
-        signal: r.buy[i] ? 'buy' : 'sell',
-        close: c[i],
-        atr: r.atr[i],
-        up: r.up[i],
-        dn: r.dn[i],
-      })
-    );
-  }
-  summary[coin] = { bars: c.length, buys, sells, params: { period, mult, method } };
+
+const required = rsiPullback.needs(params).closedBars;
+let longs = 0;
+let shorts = 0;
+for (let i = required - 1; i < bars.length; i += 1) {
+  const closedBars = bars.slice(0, i + 1);
+  const last = closedBars.at(-1);
+  const decision = rsiPullback.evaluate({
+    instId: coin,
+    phase: 'scan',
+    params,
+    market: { price: last.c, bars: closedBars.length, barMs, lastBarTs: last.ts, closedBars },
+    flags: { tradable: true, heldDirection: null },
+  });
+  if (!decision.signal || !['long', 'short'].includes(decision.target)) continue;
+  if (decision.target === 'long') longs += 1;
+  else shorts += 1;
+  console.log(JSON.stringify({
+    coin, i, ts: last.ts, time: new Date(last.ts).toISOString(), direction: decision.target,
+    close: last.c, rsi: decision.metrics.rsi, ema: decision.metrics.ema, atr: decision.metrics.atr,
+    volumeRatio: decision.metrics.volumeRatio, slPct: decision.slPct, text: decision.text,
+  }));
 }
-console.error(JSON.stringify({ summary }));
+console.error(JSON.stringify({ summary: { coin, bars: bars.length, longs, shorts, params } }));

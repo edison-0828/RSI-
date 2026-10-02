@@ -2,7 +2,7 @@
   "name": "rsi-bottom-hunter-ui",
   "version": "1.0.0",
   "private": true,
-  "description": "SuperTrend 翻转交易 - 基于 OKX SuperTrend 翻转反手的多空交易面板",
+  "description": "RSI 趋势回调自动交易 - EMA 趋势过滤、量能确认与 ATR 风控",
   "type": "module",
   "scripts": {
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run server\" \"npm run client\"",

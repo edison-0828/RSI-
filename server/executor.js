@@ -11,7 +11,7 @@
  *   5) 张数 = floor(保证金×杠杆 / (ctVal×价格) / lotSz) × lotSz，低于 minSz 则跳过
  *   6) 市价开仓（多=buy / 空=sell，net 模式不带 posSide；tdMode=cross，唯一 clOrdId，按 instId 加锁）
  *   7) 查询订单 /api/v5/trade/order 获取 avgPx/accFillSz/fee
- *   8) 交易所端保护单 /api/v5/trade/order-algo（SuperTrend：仅灾难止损 conditional；旧 RSI 持仓：OCO；市价 -1）
+ *   8) 交易所端保护单 /api/v5/trade/order-algo（当前策略：ATR 灾难止损 conditional；旧持仓可为 OCO）
  *      失败 → 立即市价平仓（fail-safe）
  *
  * 做空安全：openPosition 内断言 assertShortAllowed（RSI_ALLOW_SHORT / RSI_ALLOW_SHORT_LIVE），实盘默认禁止。
@@ -375,7 +375,7 @@ export class OkxExecutor {
    * @returns {Promise<{ok:true,pos:object}|{ok:false,skipped?:boolean,uncertain?:boolean,reason:string}>}
    */
   async openPosition({
-    instId, direction = 'long', amount, leverage, tpPct = null, slPct = null, strategyId = 'supertrend', strategyVersion = 1,
+    instId, direction = 'long', amount, leverage, tpPct = null, slPct = null, strategyId = 'rsi_pullback', strategyVersion = 1,
     signalMeta = null, maxSpreadPct, profile = 'demo', onSubmit, onPending, recheck,
   }) {
     const dir = direction === 'short' ? 'short' : 'long';
@@ -645,14 +645,14 @@ export class OkxExecutor {
     }
   }
 
-  /** 该持仓是否需要交易所保护单（SuperTrend：灾难止损>0；旧 RSI 持仓：止盈或止损>0） */
+  /** 该持仓是否需要交易所保护单（当前策略使用止损；旧持仓可能同时有止盈止损）。 */
   needsProtection(pos) {
     return Number(pos?.sl_pct) > 0 || Number(pos?.tp_pct) > 0;
   }
 
   /**
    * 为持仓挂交易所端保护单（触发后市价平仓，方向取反、reduceOnly）：
-   *  - 仅止损（SuperTrend 灾难止损）：ordType=conditional；止盈+止损（旧 RSI 持仓）：ordType=oco
+   *  - 仅止损：ordType=conditional；止盈+止损（旧持仓）：ordType=oco
    * 优先 closeFraction='1'（SWAP、市价 -1、全仓位平仓，不传 sz；net 模式须 reduceOnly=true），被拒则回退为 sz = 持仓张数。
    * tpPct / slPct 传 null 或 0 表示该侧不挂。
    */
@@ -835,6 +835,7 @@ export class OkxExecutor {
     const type = String(h.type || '');
     if (pos.close_reason === 'kill') action = 'kill';
     else if (pos.close_reason === 'failsafe') action = 'failsafe';
+    else if (pos.close_reason === 'signal') action = 'signal';
     else if (pos.close_reason === 'flip') action = 'flip';
     else if (type === '3' || type === '4') action = 'liq';
     else if (pos.algoId) {
@@ -877,6 +878,7 @@ export function reasonText(r) {
       tp: '止盈',
       sl: '止损（灾难止损）',
       flip: '信号反手平仓',
+      signal: '策略信号平仓',
       kill: '急停平仓',
       failsafe: '保护性平仓',
       manual: '手动',
