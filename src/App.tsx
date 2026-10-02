@@ -2,23 +2,30 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 type Profile = 'demo' | 'live';
 type Mode = 'spot' | 'swap';
-type Bar = '1m' | '5m' | '15m' | '1H' | '4H' | '1Dutc';
+type Bar = '1m' | '3m' | '5m' | '15m' | '30m' | '1H' | '2H' | '4H';
 type ExecMode = 'sim' | 'okx_demo' | 'okx_live';
 type SignalFilter = 'all' | 'triggered' | 'watchlist' | 'skipped';
-type SignalSort = 'priority' | 'rsi' | 'volume' | 'updated';
+type SignalSort = 'priority' | 'flip' | 'volume' | 'updated';
 type LowerTab = 'positions' | 'history' | 'filtered' | 'logs';
 type SettingsTab = 'strategy' | 'shared';
-type StrategyId = 'rsi_dip';
+type StrategyId = 'supertrend';
+type Direction = 'long' | 'short';
 type PresetId = 'conservative' | 'balanced' | 'aggressive';
 
 interface FormState {
   strategy: StrategyId;
   amount: string;
   bar: Bar;
-  rsi_period: string;
-  rsi_buy_threshold: string;
-  take_profit_pct: string;
-  stop_loss_pct: string;
+  atr_period: string;
+  atr_multiplier: string;
+  atr_method: 'rma' | 'sma';
+  disaster_stop_pct: string;
+  allow_short: boolean;
+  flip_only: boolean;
+  disaster_cooldown_minutes: string;
+  signal_max_age_sec: string;
+  sim_fee_pct: string;
+  sim_slippage_pct: string;
   max_positions: string;
   mode: Mode;
   profile: Profile;
@@ -26,18 +33,9 @@ interface FormState {
   minVolUsd24h: string;
   universeLimit: string;
   scanConcurrency: string;
-  max_consecutive_sl: string;
-  sl_filter_hours: string;
-  sl_cooldown_minutes: string;
-  severe_sl_pct: string;
-  severe_sl_cooldown_hours: string;
   leverage: string;
   watchlist: string;
   exec_mode: ExecMode;
-  confirm_on_close: boolean;
-  bb_filter_enabled: boolean;
-  bb_period: string;
-  bb_mult: string;
   daily_loss_limit_usdt: string;
   max_orders_per_hour: string;
   max_spread_pct: string;
@@ -47,8 +45,19 @@ interface SignalRow {
   instId: string;
   volUsd24h: number;
   price: number | null;
-  rsi: number | null;
-  rsiClosed?: number | null;
+  /** SuperTrend 当前趋势：1 上升 / -1 下降 / null 预热中 */
+  trend?: 1 | -1 | null;
+  st_up?: number | null;
+  st_dn?: number | null;
+  atr?: number | null;
+  readyBars?: number;
+  /** 最近一次（本次运行内记为信号的）翻转：方向与 K 线收盘时间 */
+  flipDir?: Direction | null;
+  flipAt?: string | null;
+  direction?: Direction | null;
+  held?: { direction: Direction; strategy_id: string } | null;
+  strategy_id?: string;
+  enterByTrend?: boolean;
   signal: boolean;
   signalText?: string;
   ok?: boolean;
@@ -56,14 +65,10 @@ interface SignalRow {
   at?: string;
   watchlist?: boolean;
   forming?: boolean;
+  stale?: boolean;
   filtered?: boolean;
   cooldown?: { kind: string; until: string; text: string; reason?: string } | null;
   notOnDemo?: boolean;
-  /** 布林带下轨（仅开关打开时有值） */
-  bbLower?: number | null;
-  /** RSI 已触发但被布林带过滤挡住 */
-  bbBlocked?: boolean;
-  bbReason?: string | null;
   skipped?: boolean;
   skipReason?: string | null;
   skipUntil?: string | null;
@@ -74,7 +79,8 @@ interface SignalRow {
 interface FilteredItem {
   instId: string;
   exec_mode?: ExecMode;
-  kind?: 'normal' | 'severe' | 'streak';
+  strategy_id?: string;
+  kind?: 'normal' | 'severe' | 'streak' | 'disaster';
   kindText?: string;
   streak: number;
   filteredUntil: string;
@@ -89,14 +95,17 @@ interface PositionRow {
   amount: number;
   last_price?: number | null;
   profit_pct?: number | null;
-  take_profit_price?: number;
-  stop_loss_price?: number;
-  take_profit_pct?: number;
-  stop_loss_pct?: number;
+  direction?: Direction;
+  strategy_id?: string;
+  managed?: boolean;
+  take_profit_price?: number | null;
+  stop_loss_price?: number | null;
+  tp_pct?: number | null;
+  sl_pct?: number | null;
+  liq_price?: number | null;
   simulated?: boolean;
   status?: string;
   at?: string;
-  rsi_at_entry?: number | null;
   leverage?: number;
   mode?: string;
   exec_mode?: ExecMode;
@@ -118,6 +127,7 @@ interface PositionRow {
 interface ExternalPosition {
   instId: string;
   posSide: string;
+  direction?: Direction | null;
   pos: number;
   avgPx: number | null;
   lever: number | null;
@@ -163,11 +173,13 @@ interface LiveCheckResult {
     max_positions: number;
     daily_loss_limit_usdt: number;
     max_orders_per_hour: number;
-    take_profit_pct: number;
-    stop_loss_pct: number;
+    disaster_stop_pct: number;
+    allow_short: boolean;
+    short_blocked?: string | null;
   };
   maxLeverage?: number;
   confirmText?: string;
+  shortConfirmText?: string;
 }
 
 interface RiskState {
@@ -182,8 +194,16 @@ interface RiskState {
   pending_opens?: string[];
 }
 
+interface ShortStatus {
+  env_allow_short: boolean;
+  env_allow_short_live: boolean;
+  block_reason: Partial<Record<ExecMode, string | null>>;
+  confirmText?: string;
+}
+
 interface ExecStatus {
   exec_mode: ExecMode;
+  short?: ShortStatus;
   exec_mode_text?: string;
   keysConfigured: boolean;
   account: AccountSummary;
@@ -240,6 +260,8 @@ interface PnLTrade {
   id?: string;
   instId: string;
   action: string;
+  direction?: Direction;
+  strategy_id?: string;
   entry_price: number;
   exit_price: number;
   amount: number;
@@ -272,38 +294,35 @@ interface PnLDashboard {
 }
 
 const DEFAULTS: FormState = {
-  strategy: 'rsi_dip',
+  strategy: 'supertrend',
   amount: '100',
   bar: '15m',
-  rsi_period: '6',
-  rsi_buy_threshold: '20',
-  take_profit_pct: '8',
-  stop_loss_pct: '6',
+  atr_period: '10',
+  atr_multiplier: '3',
+  atr_method: 'rma',
+  disaster_stop_pct: '8',
+  allow_short: false,
+  flip_only: true,
+  disaster_cooldown_minutes: '60',
+  signal_max_age_sec: '300',
+  sim_fee_pct: '0.05',
+  sim_slippage_pct: '0.031',
   max_positions: '5',
-  mode: 'spot',
+  mode: 'swap',
   profile: 'demo',
   refreshSec: '60',
   minVolUsd24h: '300000',
   universeLimit: '120',
   scanConcurrency: '6',
-  max_consecutive_sl: '2',
-  sl_filter_hours: '24',
-  sl_cooldown_minutes: '60',
-  severe_sl_pct: '3',
-  severe_sl_cooldown_hours: '24',
   leverage: '1',
   watchlist: '',
   exec_mode: 'sim',
-  confirm_on_close: false,
-  bb_filter_enabled: false,
-  bb_period: '20',
-  bb_mult: '2',
   daily_loss_limit_usdt: '50',
   max_orders_per_hour: '10',
   max_spread_pct: '0.3',
 };
 
-const BARS: Bar[] = ['1m', '5m', '15m', '1H', '4H', '1Dutc'];
+const BARS: Bar[] = ['1m', '3m', '5m', '15m', '30m', '1H', '2H', '4H'];
 
 /** 策略自己的一个参数项；key 指向 FormState，加策略时只需在这里声明，UI 自动渲染 */
 interface StrategyField {
@@ -338,83 +357,83 @@ interface StrategyDef {
   presets: StrategyPreset[];
 }
 
-const RSI_DIP: StrategyDef = {
-  id: 'rsi_dip',
-  name: 'RSI 抄底',
-  tagline: 'RSI 跌破阈值时买入，等超卖反弹',
-  tags: ['超卖反弹', '做多', '短中线'],
+const SUPERTREND: StrategyDef = {
+  id: 'supertrend',
+  name: 'SuperTrend 翻转反手',
+  tagline: '趋势翻转即平仓并反手，始终持仓（多空双向）',
+  tags: ['趋势跟随', '多空双向', '翻转反手'],
   summary: (f) =>
-    `RSI(${f.rsi_period}) < ${f.rsi_buy_threshold} · ${f.bar} · 止盈 ${f.take_profit_pct}% / 止损 ${f.stop_loss_pct}%`,
+    `ATR(${f.atr_period}, ${f.atr_method.toUpperCase()}) × ${f.atr_multiplier} · ${f.bar} · 灾难止损 ${Number(f.disaster_stop_pct) > 0 ? `${f.disaster_stop_pct}%` : '关闭'} · ${f.allow_short ? '允许做空' : '只做多'}`,
   fields: [
     {
       key: 'bar',
       label: 'K线周期 bar',
+      hint: '只在已收盘 K 线上判定翻转',
       control: { kind: 'select', options: BARS.map((b) => ({ value: b, label: b })) },
     },
-    { key: 'rsi_period', label: 'RSI 周期', control: { kind: 'number', min: 2 } },
+    { key: 'atr_period', label: 'ATR 周期', control: { kind: 'number', min: 1, max: 100, step: 1 } },
+    { key: 'atr_multiplier', label: 'ATR 倍数', control: { kind: 'number', min: 0.1, max: 20, step: 0.1 } },
     {
-      key: 'rsi_buy_threshold',
-      label: '买入阈值（RSI <）',
-      hint: '按实时 RSI（含未收盘 K 线）判定；建议 25–35',
-      control: { kind: 'number' },
+      key: 'atr_method',
+      label: 'ATR 方法',
+      hint: 'RMA = Pine 默认 atr()；SMA = 简单移动平均 TR',
+      control: {
+        kind: 'select',
+        options: [
+          { value: 'rma', label: 'RMA（默认）' },
+          { value: 'sma', label: 'SMA' },
+        ],
+      },
     },
-    { key: 'take_profit_pct', label: '止盈 %', control: { kind: 'number', step: 0.1 } },
-    { key: 'stop_loss_pct', label: '止损 %', control: { kind: 'number', step: 0.1 } },
     {
-      key: 'confirm_on_close',
-      label: '需收盘确认',
-      hint: '勾选后还要求最近已收盘 K 线 RSI 也低于阈值（默认不勾选）',
+      key: 'disaster_stop_pct',
+      label: '灾难止损 %',
+      hint: '入场价反向 N% 的兜底止损（防断线 / 极端行情）；0 = 关闭。正常出场靠信号翻转',
+      control: { kind: 'number', min: 0, max: 50, step: 0.5 },
+    },
+    {
+      key: 'allow_short',
+      label: '允许做空',
+      hint: '仅永续。还需服务端环境变量 RSI_ALLOW_SHORT=1（实盘另需 RSI_ALLOW_SHORT_LIVE=1），否则只做多；做空被拦时持多遇卖出翻转仍会平仓',
+      control: { kind: 'switch', text: '卖出翻转时开空 / 反手' },
+    },
+    {
+      key: 'flip_only',
+      label: '仅翻转入场',
+      hint: '勾选：只在翻转出现时入场（启动时不按当前趋势入场）；取消：无仓位时按当前趋势入场',
       advanced: true,
-      control: { kind: 'switch', text: '要求已收盘 K 线同时满足' },
-    },
-    {
-      key: 'bb_filter_enabled',
-      label: '布林带下轨过滤',
-      hint: 'RSI 触发后，还要求实时价低于布林下轨才买入（按 K 线周期计算，默认关闭）',
-      control: { kind: 'switch', text: '布林带下轨过滤（实时价需低于下轨）' },
-    },
-    {
-      key: 'bb_period',
-      label: '布林带周期',
-      hint: '前 N−1 根已收盘 K 线 + 实时价，默认 20',
-      control: { kind: 'number', min: 2, max: 100, step: 1 },
-    },
-    {
-      key: 'bb_mult',
-      label: '布林带倍数（标准差）',
-      hint: '下轨 = 均值 − 倍数 × 标准差，默认 2',
-      control: { kind: 'number', min: 0.1, max: 10, step: 0.1 },
+      control: { kind: 'switch', text: '只在翻转信号出现时入场' },
     },
   ],
   presets: [
     {
       id: 'conservative',
       label: '保守',
-      desc: '长周期 + 更深超卖 + 收盘确认，信号少但更稳',
-      values: { bar: '1H', rsi_period: '14', rsi_buy_threshold: '15', confirm_on_close: true, take_profit_pct: '6', stop_loss_pct: '4' },
+      desc: '1 小时周期，ATR(10) × 3：信号少、更稳',
+      values: { bar: '1H', atr_period: '10', atr_multiplier: '3', atr_method: 'rma', disaster_stop_pct: '8' },
     },
     {
       id: 'balanced',
       label: '均衡',
-      desc: '默认参数：15 分钟周期，RSI(6) < 20',
-      values: { bar: '15m', rsi_period: '6', rsi_buy_threshold: '20', confirm_on_close: false, take_profit_pct: '8', stop_loss_pct: '6' },
+      desc: '默认参数：15 分钟周期，ATR(10) × 3',
+      values: { bar: '15m', atr_period: '10', atr_multiplier: '3', atr_method: 'rma', disaster_stop_pct: '8' },
     },
     {
       id: 'aggressive',
       label: '激进',
-      desc: '短周期 + 浅超卖，信号多、噪音也多',
-      values: { bar: '5m', rsi_period: '6', rsi_buy_threshold: '28', confirm_on_close: false, take_profit_pct: '12', stop_loss_pct: '8' },
+      desc: '15 分钟周期，ATR(7) × 2：翻转更频繁、噪音也多',
+      values: { bar: '15m', atr_period: '7', atr_multiplier: '2', atr_method: 'rma', disaster_stop_pct: '8' },
     },
   ],
 };
 
-const STRATEGIES: StrategyDef[] = [RSI_DIP];
+const STRATEGIES: StrategyDef[] = [SUPERTREND];
 
 function getStrategy(id: StrategyId): StrategyDef {
   return STRATEGIES.find((s) => s.id === id) || STRATEGIES[0];
 }
 
-/** 实盘保守默认值（切到实盘时，若该模式没有保存过配置则套用；止盈止损沿用当前设置） */
+/** 实盘保守默认值（切到实盘时，若该模式没有保存过配置则套用） */
 const LIVE_FORM_DEFAULTS: Partial<FormState> = {
   amount: '20',
   leverage: '5',
@@ -424,9 +443,10 @@ const LIVE_FORM_DEFAULTS: Partial<FormState> = {
 };
 /** 按执行方式分开保存的字段 */
 const MODE_FIELDS: (keyof FormState)[] = ['amount', 'leverage', 'max_positions', 'daily_loss_limit_usdt', 'max_orders_per_hour'];
-const MODE_CFG_KEY = (m: ExecMode) => `rsi-bottom-hunter:mode-cfg:${m}`;
-const SETTINGS_KEY = 'rsi-bottom-hunter:strategy-settings';
+const MODE_CFG_KEY = (m: ExecMode) => `supertrend-trader:mode-cfg:${m}`;
+const SETTINGS_KEY = 'supertrend-trader:strategy-settings';
 const LIVE_CONFIRM_TEXT = '确认实盘';
+const SHORT_CONFIRM_TEXT = '确认做空';
 
 interface StoredSettings {
   form: FormState;
@@ -440,7 +460,12 @@ function loadSavedSettings(): StoredSettings {
       const parsed = JSON.parse(raw) as Partial<StoredSettings>;
       if (parsed.form && typeof parsed.form === 'object') {
         return {
-          form: { ...DEFAULTS, ...parsed.form },
+          // 只取当前表单已有的键（旧 RSI 版本保存的字段一律丢弃），策略固定为 SuperTrend
+          form: {
+            ...DEFAULTS,
+            ...Object.fromEntries(Object.entries(parsed.form).filter(([k]) => k in DEFAULTS)),
+            strategy: 'supertrend',
+          } as FormState,
           savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : '',
         };
       }
@@ -481,8 +506,9 @@ function isExchangeMode(m?: string | null) {
 }
 
 const ACTION_TEXT: Record<string, string> = {
+  flip: '信号反手/平仓',
   tp: '止盈',
-  sl: '止损',
+  sl: '灾难止损',
   kill: '急停平仓',
   failsafe: '保护平仓',
   manual: '手动',
@@ -497,9 +523,11 @@ function fmtPrice(n: number | null | undefined) {
   return n.toPrecision(4);
 }
 
-function fmtRsi(n: number | null | undefined) {
-  if (n == null || !Number.isFinite(n) || n <= 0) return '无效';
-  return n.toFixed(2);
+const DIR_TEXT: Record<string, string> = { long: '多', short: '空' };
+const STRATEGY_TEXT: Record<string, string> = { supertrend: 'SuperTrend', rsi_dip: '旧·RSI抄底' };
+
+function trendText(t: number | null | undefined) {
+  return t === 1 ? '↑ 上升' : t === -1 ? '↓ 下降' : '预热中';
 }
 
 function fmtVol(n: number | null | undefined) {
@@ -508,12 +536,6 @@ function fmtVol(n: number | null | undefined) {
   if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
   return n.toFixed(0);
-}
-
-/** 按开仓时的百分比快照反算止盈/止损价；没有快照就返回 null（显示 —），不拿当前设置冒充 */
-function exitPrice(entry: number, pct: number | null | undefined, sign: 1 | -1) {
-  if (pct == null || !Number.isFinite(pct) || pct <= 0) return null;
-  return entry * (1 + (sign * pct) / 100);
 }
 
 function fmtUsdt(n: number | null | undefined) {
@@ -535,7 +557,7 @@ function localTs(iso: string) {
   }
 }
 
-function relativeTs(iso?: string) {
+function relativeTs(iso?: string | null) {
   if (!iso) return '—';
   const time = new Date(iso).getTime();
   if (!Number.isFinite(time)) return '—';
@@ -554,16 +576,12 @@ function signalState(s: SignalRow) {
   if (s.signal && s.skipped) return { label: '已跳过', tone: 'warn', detail: s.skipReason || '' };
   if (s.signal && s.submitting) return { label: '提交中', tone: 'warn', detail: '' };
   if (s.signal) return { label: '已触发', tone: 'active', detail: s.signalText || '' };
-  if (s.bbBlocked) return { label: '布林未破', tone: 'warn', detail: s.bbReason || '' };
-  if (s.filtered) return { label: '风控过滤', tone: 'muted', detail: s.signalText || '' };
-  return { label: '观察中', tone: 'neutral', detail: '' };
+  if (s.filtered) return { label: '冷却中', tone: 'muted', detail: s.cooldown?.text || s.signalText || '' };
+  return { label: '观察中', tone: 'neutral', detail: s.signalText || '' };
 }
 
-function rsiTone(rsi: number | null | undefined, threshold: number) {
-  if (rsi == null || !Number.isFinite(rsi) || rsi <= 0) return 'invalid';
-  if (rsi < threshold) return 'hot';
-  if (rsi < threshold + 8) return 'warm';
-  return 'normal';
+function trendTone(t: number | null | undefined) {
+  return t === 1 ? 'up' : t === -1 ? 'down' : 'invalid';
 }
 
 let sessionTokenPromise: Promise<string> | null = null;
@@ -797,11 +815,12 @@ export default function App() {
   const [signalFilter, setSignalFilter] = useState<SignalFilter>('all');
   const [signalSort, setSignalSort] = useState<SignalSort>('priority');
   const [lowerTab, setLowerTab] = useState<LowerTab>('positions');
-  const [liveModal, setLiveModal] = useState<{ open: boolean; loading: boolean; check: LiveCheckResult | null; text: string; error: string | null; starting: boolean }>({
+  const [liveModal, setLiveModal] = useState<{ open: boolean; loading: boolean; check: LiveCheckResult | null; text: string; shortText: string; error: string | null; starting: boolean }>({
     open: false,
     loading: false,
     check: null,
     text: '',
+    shortText: '',
     error: null,
     starting: false,
   });
@@ -930,8 +949,8 @@ export default function App() {
     if (next === 'okx_live') {
       setModeHint(
         saved
-          ? '已切到「OKX 实盘」：已载入上次保存的实盘参数（止盈止损沿用当前设置）'
-          : '已切到「OKX 实盘」：已套用实盘保守默认值（每笔保证金 20 USDT · 5x · 最大持仓 3 · 日亏上限 30 · 每小时 5 单），止盈止损沿用当前设置'
+          ? '已切到「OKX 实盘」：已载入上次保存的实盘参数'
+          : '已切到「OKX 实盘」：已套用实盘保守默认值（每笔保证金 20 USDT · 5x · 最大持仓 3 · 日亏上限 30 · 每小时 5 单）'
       );
     } else {
       setModeHint(`已切到「${EXEC_TEXT[next]}」${saved ? '，已载入该模式上次保存的参数' : ''}`);
@@ -957,7 +976,7 @@ export default function App() {
   });
   const liveDialogRef = useDialogA11y(liveModal.open, () => {
     if (!liveModal.starting) {
-      setLiveModal({ open: false, loading: false, check: null, text: '', error: null, starting: false });
+      setLiveModal({ open: false, loading: false, check: null, text: '', shortText: '', error: null, starting: false });
     }
   });
 
@@ -969,10 +988,16 @@ export default function App() {
     return {
       amount: Number(form.amount),
       bar: form.bar,
-      rsi_period: Number(form.rsi_period),
-      rsi_buy_threshold: Number(form.rsi_buy_threshold),
-      take_profit_pct: Number(form.take_profit_pct),
-      stop_loss_pct: Number(form.stop_loss_pct),
+      atr_period: Number(form.atr_period),
+      atr_multiplier: Number(form.atr_multiplier),
+      atr_method: form.atr_method,
+      disaster_stop_pct: Number(form.disaster_stop_pct),
+      allow_short: form.mode === 'swap' && form.allow_short === true,
+      flip_only: form.flip_only !== false,
+      disaster_cooldown_minutes: Number(form.disaster_cooldown_minutes),
+      signal_max_age_sec: Number(form.signal_max_age_sec),
+      sim_fee_pct: Number(form.sim_fee_pct),
+      sim_slippage_pct: Number(form.sim_slippage_pct),
       max_positions: Number(form.max_positions),
       mode: form.mode,
       // profile 跟随执行方式（后端同样强制）：实盘=live，其余=demo
@@ -981,22 +1006,12 @@ export default function App() {
       minVolUsd24h: Number(form.minVolUsd24h),
       universeLimit: Number(form.universeLimit),
       scanConcurrency: Number(form.scanConcurrency),
-      max_consecutive_sl: Number(form.max_consecutive_sl),
-      sl_filter_hours: Number(form.sl_filter_hours),
-      sl_cooldown_minutes: Number(form.sl_cooldown_minutes ?? DEFAULTS.sl_cooldown_minutes),
-      severe_sl_pct: Number(form.severe_sl_pct ?? DEFAULTS.severe_sl_pct),
-      severe_sl_cooldown_hours: Number(form.severe_sl_cooldown_hours ?? DEFAULTS.severe_sl_cooldown_hours),
       leverage: Number(form.leverage),
       exec_mode: (form.mode === 'swap' ? form.exec_mode : 'sim') as ExecMode,
-      confirm_on_close: form.confirm_on_close,
-      bb_filter_enabled: form.bb_filter_enabled === true,
-      bb_period: Number(form.bb_period ?? DEFAULTS.bb_period),
-      bb_mult: Number(form.bb_mult ?? DEFAULTS.bb_mult),
       daily_loss_limit_usdt: Number(form.daily_loss_limit_usdt),
       max_orders_per_hour: Number(form.max_orders_per_hour),
       max_spread_pct: Number(form.max_spread_pct),
       tdMode: 'cross',
-      posSide: 'long',
       order_ccy: 'USDT',
       watchlist,
     };
@@ -1098,7 +1113,7 @@ export default function App() {
       totalPnl != null && Number.isFinite(totalPnl)
         ? ` · ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}U`
         : '';
-    document.title = `${head}${money} · RSI抄底宝`;
+    document.title = `${head}${money} · SuperTrend 翻转交易`;
     paintFavicon(
       offline
         ? '#f59e0b'
@@ -1143,7 +1158,7 @@ export default function App() {
     if (prevMode.current !== form.mode) {
       setModeHint(
         form.mode === 'swap'
-          ? '已切换到永续：USDT-SWAP · 多头 · 全仓 · 下单 USDT · 请选择杠杆后重新开始扫描'
+          ? '已切换到永续：USDT-SWAP · 可多可空（做空需在设置中开启并通过服务端开关）· 全仓 · 下单 USDT · 请选择杠杆后重新开始扫描'
           : '已切换到现货：将重新构建 USDT 现货 universe'
       );
       prevMode.current = form.mode;
@@ -1152,7 +1167,7 @@ export default function App() {
 
   /** 实盘：先做只读启动检查并弹出确认框，用户手动输入「确认实盘」后才真正开始 */
   const openLiveConfirm = async () => {
-    setLiveModal({ open: true, loading: true, check: null, text: '', error: null, starting: false });
+    setLiveModal({ open: true, loading: true, check: null, text: '', shortText: '', error: null, starting: false });
     try {
       const d = await api<LiveCheckResult>('/api/live/check', { method: 'POST', body: JSON.stringify(payload) });
       if (d.account) setAccount(d.account);
@@ -1164,15 +1179,16 @@ export default function App() {
 
   const onConfirmLiveStart = async () => {
     if (liveModal.text.trim() !== LIVE_CONFIRM_TEXT) return;
+    if (liveModal.check?.summary?.allow_short && liveModal.shortText.trim() !== (liveModal.check.shortConfirmText || SHORT_CONFIRM_TEXT)) return;
     setLiveModal((m) => ({ ...m, starting: true, error: null }));
     try {
       const data = await api<{ note?: string; scan: ScanStatus }>('/api/scan/start', {
         method: 'POST',
-        body: JSON.stringify({ ...payload, confirm_text: liveModal.text.trim() }),
+        body: JSON.stringify({ ...payload, confirm_text: liveModal.text.trim(), short_confirm_text: liveModal.shortText.trim() }),
       });
       if (data.note) setConfigHint(data.note);
       setScan(data.scan || { running: true });
-      setLiveModal({ open: false, loading: false, check: null, text: '', error: null, starting: false });
+      setLiveModal({ open: false, loading: false, check: null, text: '', shortText: '', error: null, starting: false });
       await refreshStatus();
     } catch (e) {
       setLiveModal((m) => ({ ...m, starting: false, error: e instanceof Error ? e.message : String(e) }));
@@ -1184,7 +1200,7 @@ export default function App() {
     setModeHint(null);
     try {
       if (!Number.isFinite(payload.amount) || payload.amount <= 0) {
-        throw new Error('请填写有效的买入金额 amount');
+        throw new Error('请填写有效的每笔金额 amount');
       }
       if (payload.universeLimit < 1 || payload.universeLimit > 200) {
         throw new Error('universeLimit 建议 10–200');
@@ -1240,7 +1256,7 @@ export default function App() {
           instId: it.instId,
           volUsd24h: it.volUsd24h,
           price: it.price ?? null,
-          rsi: null,
+          trend: null,
           signal: false,
           at: new Date().toISOString(),
         }))
@@ -1282,13 +1298,13 @@ export default function App() {
       confirmText: closeAll ? '急停并全部平仓' : '确认急停',
       body: closeAll ? (
         <>
-          <p>将停止扫描、禁止开新仓，并按交易所持仓数量市价平掉本程序管理的全部 OKX 模拟盘 / 实盘持仓（撤销其止盈止损），本地模拟持仓按现价平仓。</p>
+          <p>将停止扫描、禁止开新仓，并按交易所持仓数量市价平掉本程序管理的全部 OKX 模拟盘 / 实盘持仓（撤销其保护单），本地模拟持仓按现价平仓。</p>
           <p className="dim">交易所上非本程序开的外部仓位不会被平掉。</p>
         </>
       ) : (
         <>
           <p>将停止扫描并禁止开新仓。</p>
-          <p className="dim">已有持仓保留，模拟盘 / 实盘持仓仍由交易所止盈止损保护。</p>
+          <p className="dim">已有持仓保留，模拟盘 / 实盘持仓仍由交易所保护单（灾难止损）保护；但不再随信号反手。</p>
         </>
       ),
     });
@@ -1331,7 +1347,6 @@ export default function App() {
     const n = Number(running ? scan.config?.[key] : undefined);
     return Number.isFinite(n) && n > 0 ? n : Number(fallback);
   };
-  const activeRsiThreshold = runCfgNum('rsi_buy_threshold', form.rsi_buy_threshold);
   const activeMaxPositions = runCfgNum('max_positions', form.max_positions);
   const killOn = !!exec?.risk?.kill_switch?.on;
   const isDemoExec = form.mode === 'swap' && form.exec_mode === 'okx_demo';
@@ -1363,7 +1378,7 @@ export default function App() {
       all: signals.length,
       triggered: signals.filter((s) => s.signal && !s.skipped).length,
       watchlist: signals.filter((s) => s.watchlist).length,
-      skipped: signals.filter((s) => s.skipped || s.filtered || s.notOnDemo || s.bbBlocked).length,
+      skipped: signals.filter((s) => s.skipped || s.filtered || s.notOnDemo).length,
     }),
     [signals],
   );
@@ -1373,17 +1388,17 @@ export default function App() {
       if (query && !s.instId.toUpperCase().includes(query)) return false;
       if (signalFilter === 'triggered') return s.signal && !s.skipped;
       if (signalFilter === 'watchlist') return !!s.watchlist;
-      if (signalFilter === 'skipped') return !!(s.skipped || s.filtered || s.notOnDemo || s.bbBlocked);
+      if (signalFilter === 'skipped') return !!(s.skipped || s.filtered || s.notOnDemo);
       return true;
     });
-    const rsiValue = (s: SignalRow) => (s.rsi != null && Number.isFinite(s.rsi) && s.rsi > 0 ? s.rsi : Number.POSITIVE_INFINITY);
+    const flipTime = (s: SignalRow) => (s.flipAt ? new Date(s.flipAt).getTime() : 0);
     const priority = (s: SignalRow) =>
       s.signal && !s.skipped ? 0 : s.submitting ? 1 : s.skipped ? 2 : s.watchlist ? 3 : s.filtered || s.notOnDemo ? 5 : 4;
     return [...result].sort((a, b) => {
-      if (signalSort === 'rsi') return rsiValue(a) - rsiValue(b);
+      if (signalSort === 'flip') return flipTime(b) - flipTime(a);
       if (signalSort === 'volume') return (b.volUsd24h || 0) - (a.volUsd24h || 0);
       if (signalSort === 'updated') return new Date(b.at || 0).getTime() - new Date(a.at || 0).getTime();
-      return priority(a) - priority(b) || rsiValue(a) - rsiValue(b);
+      return priority(a) - priority(b) || flipTime(b) - flipTime(a);
     });
   }, [signals, signalFilter, signalQuery, signalSort]);
 
@@ -1392,13 +1407,13 @@ export default function App() {
       <header className="header">
         <div className="brand">
           <h1>
-            <span className="accent">RSI抄底宝</span>
+            <span className="accent">SuperTrend 翻转交易</span>
             <span style={{ color: 'var(--text-dim)', fontWeight: 500, fontSize: '1rem' }}>
               · 交易监控台
             </span>
           </h1>
           <div className="subtitle">
-            全市场 RSI 信号监控 · OKX WebSocket 实时行情 · 模拟与实盘分级执行
+            SuperTrend 翻转反手 · 多空双向 · OKX WebSocket 实时行情 · 模拟与实盘分级执行
           </div>
         </div>
         <div className="header-controls">
@@ -1610,7 +1625,7 @@ export default function App() {
                 </div>
               </div>
               <div className="metric">
-                <div className="label">止损过滤中</div>
+                <div className="label">冷却中</div>
                 <div className={`value ${(scan.filteredCount || 0) > 0 ? 'amber' : 'dim'}`}>
                   {scan.filteredCount ?? 0}
                 </div>
@@ -1676,7 +1691,7 @@ export default function App() {
             <div className="signal-banner">
               {scan.note ||
                 (running
-                  ? `WebSocket 推送中 · RSI < ${activeRsiThreshold} · ${form.mode} · K线订阅 ${scan.ws?.candleSubs ?? 0}`
+                  ? `WebSocket 推送中 · SuperTrend(${runCfgNum('atr_period', form.atr_period)}, ${runCfgNum('atr_multiplier', form.atr_multiplier)}) · ${form.mode} · K线订阅 ${scan.ws?.candleSubs ?? 0}`
                   : '选择 mode → 设置成交量/数量上限 → 点击「开始全市场扫描」（REST 预热 + WS 推送）')}
             </div>
             {scan.lastScanAt && (
@@ -1773,7 +1788,7 @@ export default function App() {
               className={settingsTab === 'shared' ? 'active' : ''}
               onClick={() => setSettingsTab('shared')}
             >
-              通用设置<span>{form.mode === 'swap' ? 14 : 12}</span>
+              通用设置<span>{form.mode === 'swap' ? 11 : 9}</span>
             </button>
           </div>
 
@@ -1820,8 +1835,8 @@ export default function App() {
               <summary>执行与账户{form.mode === 'swap' && <span>2</span>}</summary>
               <div className="settings-facts">
                 {form.mode === 'swap'
-                  ? ['全仓 cross', '多头 long', '下单单位 USDT'].map((t) => <span key={t}>{t}</span>)
-                  : ['结算 USDT', '现货买入', '无杠杆', '本地模拟执行'].map((t) => <span key={t}>{t}</span>)}
+                  ? ['全仓 cross', form.allow_short ? '多空双向 net' : '只做多', '下单单位 USDT'].map((t) => <span key={t}>{t}</span>)
+                  : ['结算 USDT', '现货只做多（不支持做空）', '无杠杆', '本地模拟执行'].map((t) => <span key={t}>{t}</span>)}
               </div>
               <div className="form-grid">
             {form.mode === 'swap' && (
@@ -1910,7 +1925,7 @@ export default function App() {
                         </button>
                       </div>
                       <div className="hint">
-                        下单后立即在交易所挂 OCO 止盈止损（closeFraction=1 全仓，程序崩溃也受保护）；平仓以交易所为准，盈亏为真实已实现（含手续费）。
+                        下单后立即在交易所挂灾难止损（conditional 算法单，全仓平仓，程序崩溃也受保护）；正常出场靠 SuperTrend 翻转，盈亏为真实已实现（含手续费）。做空 / 反手路径尚未经真实环境验证，请先在 OKX 模拟盘小额试跑。
                         {form.exec_mode === 'okx_live' ? ' 实盘要求：Key 只开读取+交易（不开提现）、绑定 IP；账户模式为合约模式、持仓模式为买卖模式。' : ''}
                       </div>
                     </div>
@@ -1950,60 +1965,26 @@ export default function App() {
               />
             </div>
             <div className="field">
-              <label>普通止损冷却(分钟)</label>
+              <label>灾难止损后冷却（分钟）</label>
               <input
                 type="number"
                 min="0"
                 max="1440"
-                value={form.sl_cooldown_minutes ?? DEFAULTS.sl_cooldown_minutes}
-                onChange={(e) => setField('sl_cooldown_minutes', e.target.value)}
+                value={form.disaster_cooldown_minutes}
+                onChange={(e) => setField('disaster_cooldown_minutes', e.target.value)}
               />
-              <div className="hint">止损平仓后该币暂停开仓的分钟数，默认 60；0 = 不冷却</div>
+              <div className="hint">灾难止损 / 强平后该币暂停入场的分钟数，默认 60；信号平仓不冷却；0 = 不冷却</div>
             </div>
             <div className="field">
-              <label>严重止损阈值(%)</label>
+              <label>信号有效期（秒）</label>
               <input
                 type="number"
-                min="0.5"
-                max="50"
-                step="0.1"
-                value={form.severe_sl_pct ?? DEFAULTS.severe_sl_pct}
-                onChange={(e) => setField('severe_sl_pct', e.target.value)}
+                min="30"
+                max="3600"
+                value={form.signal_max_age_sec}
+                onChange={(e) => setField('signal_max_age_sec', e.target.value)}
               />
-              <div className="hint">实际平仓亏损（价格变动，不含杠杆）≥ 此值按严重止损处理，默认 3</div>
-            </div>
-            <div className="field">
-              <label>严重止损冷却(小时)</label>
-              <input
-                type="number"
-                min="0"
-                max="168"
-                value={form.severe_sl_cooldown_hours ?? DEFAULTS.severe_sl_cooldown_hours}
-                onChange={(e) => setField('severe_sl_cooldown_hours', e.target.value)}
-              />
-              <div className="hint">严重止损（或强平）后该币暂停开仓的小时数，默认 24</div>
-            </div>
-            <div className="field">
-              <label>窗口内止损次数后过滤</label>
-              <input
-                type="number"
-                min="1"
-                max="20"
-                value={form.max_consecutive_sl}
-                onChange={(e) => setField('max_consecutive_sl', e.target.value)}
-              />
-              <div className="hint">同一币在「过滤时长」窗口内累计止损达此次数后暂停开仓（中间止盈不清零）</div>
-            </div>
-            <div className="field">
-              <label>过滤时长（小时）</label>
-              <input
-                type="number"
-                min="0"
-                max="720"
-                value={form.sl_filter_hours}
-                onChange={(e) => setField('sl_filter_hours', e.target.value)}
-              />
-              <div className="hint">同时是止损计数窗口，默认 24；填 0 表示长期过滤（可手动解除）</div>
+              <div className="hint">翻转超过此时间才被处理时，只平仓、不入场 / 不反手，默认 300</div>
             </div>
             <div className="field">
               <label>风控：单日亏损上限 USDT</label>
@@ -2065,7 +2046,7 @@ export default function App() {
                 value={form.universeLimit}
                 onChange={(e) => setField('universeLimit', e.target.value)}
               />
-              <div className="hint">默认 120，最大 200；越大 RSI 越慢</div>
+              <div className="hint">默认 120，最大 200；越大扫描越慢</div>
             </div>
             <div className="field">
               <label>扫描并发</label>
@@ -2229,8 +2210,8 @@ export default function App() {
             </span>
           </h2>
           <div className="signals-legend">
-            <span><i className="legend-dot hot" />超卖 &lt; {activeRsiThreshold}</span>
-            <span><i className="legend-dot warm" />临界 &lt; {activeRsiThreshold + 8}</span>
+            <span><i className="legend-dot hot" />下降趋势</span>
+            <span><i className="legend-dot up" />上升趋势</span>
             {running && <span className="legend-note">按运行中的配置</span>}
           </div>
         </div>
@@ -2265,7 +2246,7 @@ export default function App() {
             <span>排序</span>
             <select value={signalSort} onChange={(e) => setSignalSort(e.target.value as SignalSort)}>
               <option value="priority">信号优先</option>
-              <option value="rsi">RSI 从低到高</option>
+              <option value="flip">最近翻转</option>
               <option value="volume">成交额从高到低</option>
               <option value="updated">最近更新</option>
             </select>
@@ -2278,7 +2259,8 @@ export default function App() {
                 <th>交易对</th>
                 <th>24h成交额</th>
                 <th>价格</th>
-                <th>RSI</th>
+                <th>趋势 / 最近翻转</th>
+                <th>持仓</th>
                 <th>信号</th>
                 <th>更新时间</th>
               </tr>
@@ -2286,7 +2268,7 @@ export default function App() {
             <tbody>
               {visibleSignals.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="empty-cell">
+                  <td colSpan={7} className="empty-cell">
                     <div className="signal-empty">
                       <strong>{signals.length === 0 ? '尚未生成扫描结果' : '没有符合当前筛选的交易对'}</strong>
                       <span>{signals.length === 0 ? '可以先预览市场，确认 Universe 范围。' : '尝试清空搜索或切换筛选条件。'}</span>
@@ -2311,16 +2293,24 @@ export default function App() {
                     <td className="mono">{fmtVol(s.volUsd24h)}</td>
                     <td>
                       <FlashNum value={s.price} className="mono">${fmtPrice(s.price)}</FlashNum>
-                      {s.bbLower != null && Number.isFinite(s.bbLower) ? (
-                        <div className="table-meta" title="布林带下轨（实时）">下轨 {fmtPrice(s.bbLower)}</div>
-                      ) : null}
                     </td>
                     <td className="mono">
-                      <span className={`rsi-chip ${rsiTone(s.rsi, activeRsiThreshold)}`}>{fmtRsi(s.rsi)}</span>
-                      {s.forming ? <span className="tag">实时</span> : null}
-                      {s.forming && s.rsiClosed != null && s.rsiClosed > 0 ? (
-                        <span className="table-meta"> 收盘 {s.rsiClosed.toFixed(2)}</span>
+                      <span className={`rsi-chip ${trendTone(s.trend)}`}>{trendText(s.trend)}</span>
+                      {s.stale ? <span className="tag">数据断档</span> : null}
+                      {s.flipAt ? (
+                        <div className="table-meta" title={localTs(s.flipAt)}>
+                          {s.flipDir ? `${s.flipDir === 'long' ? '买入' : '卖出'}翻转 ` : ''}{relativeTs(s.flipAt)}
+                        </div>
                       ) : null}
+                    </td>
+                    <td>
+                      {s.held ? (
+                        <span className={`dir-badge ${s.held.direction}`}>
+                          {DIR_TEXT[s.held.direction]} · {STRATEGY_TEXT[s.held.strategy_id] || s.held.strategy_id}
+                        </span>
+                      ) : (
+                        <span className="dim">—</span>
+                      )}
                     </td>
                     <td title={s.signalText || ''}>
                       {s.notOnDemo ? (
@@ -2336,12 +2326,9 @@ export default function App() {
                       ) : s.signal && s.submitting ? (
                         <span className="pill warn">提交中</span>
                       ) : s.signal ? (
-                        <span className="pill on">触发</span>
-                      ) : s.bbBlocked ? (
-                        <>
-                          <span className="pill warn">布林未破</span>
-                          <div className="skip-reason">{s.bbReason}</div>
-                        </>
+                        <span className={`pill on`}>
+                          {s.direction === 'short' ? '触发·做空' : s.direction === 'long' ? '触发·做多' : '触发'}
+                        </span>
                       ) : s.cooldown ? (
                         <>
                           <span className="pill">冷却</span>
@@ -2383,9 +2370,9 @@ export default function App() {
                   </div>
                   <div className="signal-card-main">
                     <div>
-                      <span className="signal-label">RSI</span>
-                      <strong className={`rsi-mobile ${rsiTone(s.rsi, activeRsiThreshold)}`}>{fmtRsi(s.rsi)}</strong>
-                      {s.forming ? <span className="tag">实时</span> : null}
+                      <span className="signal-label">趋势</span>
+                      <strong className={`rsi-mobile ${trendTone(s.trend)}`}>{trendText(s.trend)}</strong>
+                      {s.held ? <span className={`dir-badge ${s.held.direction}`}>持{DIR_TEXT[s.held.direction]}</span> : null}
                     </div>
                     <div>
                       <span className="signal-label">现价</span>
@@ -2396,13 +2383,13 @@ export default function App() {
                       <strong className="mono">{fmtVol(s.volUsd24h)}</strong>
                     </div>
                   </div>
-                  {(state.detail || (s.forming && s.rsiClosed != null && s.rsiClosed > 0)) && (
+                  {(state.detail || s.flipAt) && (
                     <div className="signal-card-detail">
-                      {state.detail || `收盘 RSI ${s.rsiClosed?.toFixed(2)}`}
+                      {state.detail || `${s.flipDir === 'long' ? '买入' : '卖出'}翻转 ${relativeTs(s.flipAt)}`}
                     </div>
                   )}
                   <div className="signal-card-foot">
-                    <span>{s.forming ? '实时 K 线' : '已收盘 K 线'}</span>
+                    <span>{s.stale ? '数据断档' : '已收盘 K 线判定'}</span>
                     <time title={s.at ? localTs(s.at) : ''}>{relativeTs(s.at)}</time>
                   </div>
                 </article>
@@ -2421,7 +2408,7 @@ export default function App() {
             <span>平仓记录</span><b>{pnl?.closed_trades ?? 0}</b>
           </button>
           <button type="button" className={lowerTab === 'filtered' ? 'active' : ''} onClick={() => setLowerTab('filtered')}>
-            <span>止损过滤</span><b>{filtered.length}</b>
+            <span>同币冷却</span><b>{filtered.length}</b>
           </button>
           <button type="button" className={lowerTab === 'logs' ? 'active' : ''} onClick={() => setLowerTab('logs')}>
             <span>事件日志</span><b>{logs.length}</b>
@@ -2445,8 +2432,8 @@ export default function App() {
                 <th>交易对</th>
                 <th>均价 → 现价</th>
                 <th>浮动盈亏</th>
-                <th>止盈 / 止损</th>
-                {hasExchangePos && <th>交易所止盈止损</th>}
+                <th>灾难止损 / 强平价</th>
+                {hasExchangePos && <th>交易所保护单</th>}
                 <th>状态</th>
                 <th className="col-action">操作</th>
               </tr>
@@ -2458,15 +2445,17 @@ export default function App() {
                     <div className="compact-empty">
                       <span className="empty-icon">◇</span>
                       <strong>暂无持仓</strong>
-                      <span>信号触发且未满仓时将{isLiveExec ? '在 OKX 实盘下单（真实资金）' : isDemoExec ? '在 OKX 模拟盘下单' : '模拟买入'}。</span>
+                      <span>信号触发且未满仓时将{isLiveExec ? '在 OKX 实盘下单（真实资金）' : isDemoExec ? '在 OKX 模拟盘下单' : '模拟开仓'}。</span>
                     </div>
                   </td>
                 </tr>
               ) : (
                 positions.map((p) => {
                   const isDemo = isExchangeMode(p.exec_mode);
-                  const tp = p.take_profit_price ?? exitPrice(p.entry_price, p.take_profit_pct, 1);
-                  const sl = p.stop_loss_price ?? exitPrice(p.entry_price, p.stop_loss_pct, -1);
+                  const tp = p.take_profit_price ?? null;
+                  const sl = p.stop_loss_price ?? null;
+                  const dir: Direction = p.direction === 'short' ? 'short' : 'long';
+                  const legacy = p.managed === false;
                   const pct = p.profit_pct;
                   const lev = p.leverage || 1;
                   const uplUsdt =
@@ -2479,8 +2468,13 @@ export default function App() {
                     <tr key={p.instId}>
                       <td>
                         <div className="cell-stack">
-                          <span className="mono">{p.instId}</span>
+                          <span className="mono">
+                            {p.instId}{' '}
+                            <span className={`dir-badge ${dir}`}>{DIR_TEXT[dir]}</span>
+                            {legacy ? <span className="tag" title="旧策略持仓：SuperTrend 不会开/平/反手，只对账">旧策略·只对账</span> : null}
+                          </span>
                           <span className="cell-sub">
+                            {STRATEGY_TEXT[p.strategy_id || ''] || p.strategy_id || ''}{' · '}
                             {p.mode === 'swap' || lev > 1 ? `${lev}x · ` : ''}
                             {p.amount} USDT
                             {isDemo ? ` · ${p.contractsStr ?? p.contracts ?? '—'} 张` : ''}
@@ -2510,8 +2504,11 @@ export default function App() {
                       </td>
                       <td>
                         <div className="cell-stack">
-                          <span className="mono text-green">{tp == null ? '—' : `$${fmtPrice(tp)}`}</span>
-                          <span className="cell-sub mono text-rose">{sl == null ? '—' : `$${fmtPrice(sl)}`}</span>
+                          <span className="mono text-rose">{sl == null ? '—' : `$${fmtPrice(sl)}`}</span>
+                          <span className="cell-sub mono">
+                            {legacy && tp != null ? `止盈 $${fmtPrice(tp)} · ` : ''}
+                            强平 {p.liq_price == null ? '—' : `$${fmtPrice(p.liq_price)}`}
+                          </span>
                         </div>
                       </td>
                       {hasExchangePos && (
@@ -2520,7 +2517,7 @@ export default function App() {
                           <span className="pill">本地监控</span>
                         ) : p.tp_sl_attached && p.tp_sl_full !== false ? (
                           <span className="pill on">
-                            ✅ 已挂 OCO{p.algo_close_fraction ? '（全仓）' : p.algo_sz ? `（${p.algo_sz} 张）` : ''}
+                            ✅ 已挂{legacy ? ' OCO' : '灾难止损'}{p.algo_close_fraction ? '（全仓）' : p.algo_sz ? `（${p.algo_sz} 张）` : ''}
                           </span>
                         ) : p.tp_sl_attached ? (
                           <span className="pill text-rose">⚠️ 仅覆盖部分{p.algo_sz ? ` ${p.algo_sz} 张` : ''}</span>
@@ -2558,7 +2555,7 @@ export default function App() {
         {externalPositions.length > 0 && (
           <div className="table-wrap" style={{ marginTop: 12 }}>
             <div className="table-meta" style={{ marginBottom: 8 }}>
-              外部持仓（{viewModeText}上非本程序开的仓位，仅展示，不做管理/止盈止损/急停平仓）
+              外部持仓（{viewModeText}上非本程序开的仓位，仅展示，不做管理/反手/急停平仓）
             </div>
             <table className="data-table">
               <thead>
@@ -2580,7 +2577,7 @@ export default function App() {
                     <td>
                       <span className="tag">外部持仓</span>
                     </td>
-                    <td>{x.posSide === 'long' ? '多' : x.posSide === 'short' ? '空' : x.pos > 0 ? '多(净)' : '空(净)'}</td>
+                    <td>{x.direction === 'short' ? '空' : x.direction === 'long' ? '多' : x.posSide === 'long' ? '多' : x.posSide === 'short' ? '空' : x.pos > 0 ? '多(净)' : '空(净)'}</td>
                     <td className="mono">{x.pos}</td>
                     <td className="mono">{x.lever ? `${x.lever}x` : '—'}</td>
                     <td className="mono">${fmtPrice(x.avgPx)}</td>
@@ -2607,6 +2604,7 @@ export default function App() {
                   <tr>
                     <th>时间</th>
                     <th>交易对</th>
+                    <th>方向 / 策略</th>
                     <th>平仓原因</th>
                     <th>入场 → 出场</th>
                     <th>金额</th>
@@ -2620,7 +2618,7 @@ export default function App() {
                         <div className="compact-empty">
                           <span className="empty-icon">⇄</span>
                           <strong>暂无平仓记录</strong>
-                          <span>持仓触发止盈、止损或手动平仓后会显示在这里。</span>
+                          <span>持仓被信号反手 / 平仓、灾难止损或手动平仓后会显示在这里。</span>
                         </div>
                       </td>
                     </tr>
@@ -2635,6 +2633,12 @@ export default function App() {
                               {EXEC_TEXT[t.exec_mode || 'sim'] || '本地模拟'}
                               {t.leverage && t.leverage > 1 ? ` · ${t.leverage}x` : ''}
                             </span>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="cell-stack">
+                            <span className={`dir-badge ${t.direction === 'short' ? 'short' : 'long'}`}>{DIR_TEXT[t.direction || 'long']}</span>
+                            <span className="cell-sub">{STRATEGY_TEXT[t.strategy_id || ''] || t.strategy_id || '旧·RSI抄底'}</span>
                           </div>
                         </td>
                         <td><span className={`pill ${t.action === 'tp' ? 'on' : ''}`}>{ACTION_TEXT[t.action] || t.action}</span></td>
@@ -2664,8 +2668,8 @@ export default function App() {
         {lowerTab === 'filtered' && (
       <section className="card filters-card">
         <div className="card-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h2 style={{ margin: 0 }}>同币冷却 / 止损过滤</h2>
-          <span className="table-meta">{filtered.length} 个币暂停开仓</span>
+          <h2 style={{ margin: 0 }}>同币冷却</h2>
+          <span className="table-meta">{filtered.length} 个币暂停入场</span>
         </div>
         <div className="table-wrap">
           <table className="data-table">
@@ -2673,6 +2677,7 @@ export default function App() {
               <tr>
                 <th>交易对</th>
                 <th>模式</th>
+                <th>策略</th>
                 <th>类型</th>
                 <th>窗口内止损</th>
                 <th>冷却至</th>
@@ -2684,8 +2689,8 @@ export default function App() {
             <tbody>
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="empty-cell">
-                    暂无。止损平仓后的冷却币（普通 / 严重 / 窗口内多次止损）会出现在这里。
+                  <td colSpan={9} className="empty-cell">
+                    暂无。灾难止损 / 强平后的冷却币会出现在这里（信号平仓不冷却）。
                   </td>
                 </tr>
               ) : (
@@ -2693,6 +2698,7 @@ export default function App() {
                   <tr key={`${f.exec_mode || 'sim'}-${f.instId}`}>
                     <td className="mono">{f.instId}</td>
                     <td>{EXEC_TEXT[f.exec_mode || 'sim'] || f.exec_mode}</td>
+                    <td>{STRATEGY_TEXT[f.strategy_id || ''] || f.strategy_id || '—'}</td>
                     <td>{f.kindText || '连续止损'}</td>
                     <td className="mono">{f.streak}</td>
                     <td className="mono">{localTs(f.filteredUntil)}</td>
@@ -2706,7 +2712,7 @@ export default function App() {
                           try {
                             await api('/api/filtered/clear', {
                               method: 'POST',
-                              body: JSON.stringify({ instId: f.instId, exec_mode: f.exec_mode }),
+                              body: JSON.stringify({ instId: f.instId, exec_mode: f.exec_mode, strategy_id: f.strategy_id }),
                             });
                             await refreshStatus();
                           } catch (e) {
@@ -2800,7 +2806,7 @@ export default function App() {
               </table>
               <div className={isExch ? 'live-warn' : 'config-hint'}>
                 {isExch
-                  ? `将撤销该仓位在交易所的止盈止损委托，并按交易所持仓张数市价全平。${p.exec_mode === 'okx_live' ? '这会动用真实资金，盈亏立即实现。' : ''}实际成交价可能与现价有偏差。`
+                  ? `将撤销该仓位在交易所的保护单（灾难止损 / OCO），并按交易所持仓张数市价全平。${p.exec_mode === 'okx_live' ? '这会动用真实资金，盈亏立即实现。' : ''}实际成交价可能与现价有偏差。`
                   : '按当前现价记账平仓，并写入平仓记录（平仓原因记为「手动」）。'}
               </div>
               {closeModal.error && <div className="error-toast">{closeModal.error}</div>}
@@ -2865,9 +2871,21 @@ export default function App() {
                         <td className="mono">{liveModal.check.summary.max_orders_per_hour} 单</td>
                       </tr>
                       <tr>
-                        <td>止盈 / 止损</td>
+                        <td>灾难止损</td>
                         <td className="mono">
-                          +{liveModal.check.summary.take_profit_pct}% / -{liveModal.check.summary.stop_loss_pct}%（交易所 OCO，全仓）
+                          {liveModal.check.summary.disaster_stop_pct > 0
+                            ? `${liveModal.check.summary.disaster_stop_pct}%（交易所 conditional 算法单，全仓）`
+                            : '已关闭（仅靠信号反手出场，不建议）'}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td>做空 / 反手</td>
+                        <td className={`mono ${liveModal.check.summary.allow_short ? 'text-rose' : ''}`}>
+                          {liveModal.check.summary.allow_short
+                            ? '已开启（真实资金做空，风险高于做多）'
+                            : liveModal.check.summary.short_blocked
+                              ? `未开启：${liveModal.check.summary.short_blocked}`
+                              : '未开启（只做多）'}
                         </td>
                       </tr>
                     </tbody>
@@ -2902,6 +2920,16 @@ export default function App() {
                     />
                   </div>
                 )}
+                {liveModal.check?.ok && liveModal.check.summary?.allow_short && (
+                  <div className="field">
+                    <label>已开启做空，请再手动输入「{liveModal.check.shortConfirmText || SHORT_CONFIRM_TEXT}」</label>
+                    <input
+                      value={liveModal.shortText}
+                      onChange={(e) => setLiveModal((m) => ({ ...m, shortText: e.target.value }))}
+                      placeholder={liveModal.check.shortConfirmText || SHORT_CONFIRM_TEXT}
+                    />
+                  </div>
+                )}
               </>
             )}
             {liveModal.error && <div className="error-toast">{liveModal.error}</div>}
@@ -2909,7 +2937,12 @@ export default function App() {
               <button
                 type="button"
                 className="btn btn-danger"
-                disabled={!liveModal.check?.ok || liveModal.text.trim() !== LIVE_CONFIRM_TEXT || liveModal.starting}
+                disabled={
+                  !liveModal.check?.ok ||
+                  liveModal.text.trim() !== LIVE_CONFIRM_TEXT ||
+                  (!!liveModal.check?.summary?.allow_short && liveModal.shortText.trim() !== (liveModal.check.shortConfirmText || SHORT_CONFIRM_TEXT)) ||
+                  liveModal.starting
+                }
                 onClick={onConfirmLiveStart}
               >
                 {liveModal.starting ? <span className="spinner" /> : '▶'} 开始实盘
@@ -2918,7 +2951,7 @@ export default function App() {
                 type="button"
                 className="btn btn-ghost"
                 disabled={liveModal.starting}
-                onClick={() => setLiveModal({ open: false, loading: false, check: null, text: '', error: null, starting: false })}
+                onClick={() => setLiveModal({ open: false, loading: false, check: null, text: '', shortText: '', error: null, starting: false })}
               >
                 取消
               </button>
@@ -2932,7 +2965,7 @@ export default function App() {
       <footer className="footer">
         <strong>风险提示：</strong>
         默认本地模拟成交；「OKX 模拟盘」仅调用模拟盘接口（不涉及真实资金）；<strong>「OKX 实盘」使用真实资金</strong>
-        ，需在 server/.env.local 配置实盘 Key、通过启动检查并手动输入「确认实盘」后才会下单。模拟盘成交价可能与 WebSocket 实盘行情略有差异。行情改为 OKX WebSocket 推送 + 本地 RSI；订阅过多会拆多连接并自动重连。RSI 抄底在单边下跌中可能连续止损。本工具仅供学习研究，不构成投资建议，盈亏自负。
+        ，需在 server/.env.local 配置实盘 Key、通过启动检查并手动输入「确认实盘」后才会下单；实盘做空另需服务端环境变量 RSI_ALLOW_SHORT=1 与 RSI_ALLOW_SHORT_LIVE=1 并输入「确认做空」。模拟盘成交价可能与 WebSocket 实盘行情略有差异。行情改为 OKX WebSocket 推送 + 本地 SuperTrend 计算；订阅过多会拆多连接并自动重连。SuperTrend 翻转反手在震荡行情中会频繁来回止损（反复被打），做空与反手风险高于做多，默认关闭。本工具仅供学习研究，不构成投资建议，盈亏自负。
       </footer>
     </div>
   );

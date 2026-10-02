@@ -2,7 +2,7 @@
   "name": "rsi-bottom-hunter-ui",
   "version": "1.0.0",
   "private": true,
-  "description": "RSI抄底宝 - 基于 OKX RSI 超卖信号的抄底策略监控面板",
+  "description": "SuperTrend 翻转交易 - 基于 OKX SuperTrend 翻转反手的多空交易面板",
   "type": "module",
   "scripts": {
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run server\" \"npm run client\"",

@@ -85,7 +85,7 @@ function runChild(extraEnv) {
 test('隔离变量下 import index.js：不监听端口、进程自行退出、数据只落在临时目录、不碰真实 data', () => {
   const dir = mkdtempSync(join(tmpdir(), 'rsi-iso-'));
   try {
-    // 预置一个“已有 sim 持仓”的状态文件，证明读取走的是临时目录
+    // 预置一个“已有旧 sim 持仓”的状态文件，证明读取走的是临时目录
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, 'positions.json'),
@@ -94,41 +94,48 @@ test('隔离变量下 import index.js：不监听端口、进程自行退出、�
     );
     const before = snapshotDir(REAL_DATA);
     const port = 20000 + Math.floor(Math.random() * 20000);
-    const r = runChild({ RSI_NO_LISTEN: '1', RSI_DATA_DIR: dir, RSI_NO_ENV_LOCAL: '1', PORT: String(port), RSI_ENGINE_SHADOW: '1' });
+    const r = runChild({ RSI_NO_LISTEN: '1', RSI_DATA_DIR: dir, RSI_NO_ENV_LOCAL: '1', PORT: String(port) });
     assert.equal(r.status, 0, `子进程应正常退出（无监听 / 无定时器让进程挂住）：${r.stderr}`);
     assert.ok(r.out, `应有 JSON 输出：${r.stdout}`);
     assert.equal(r.out.hasHook, true);
     assert.equal(resolve(r.out.dataDir), resolve(dir), '数据目录应为临时目录');
     assert.equal(r.out.portFree, true, 'import 后端口仍空闲 = 没有 listen');
     assert.deepEqual(r.out.positionsAtLoad, ['ZZZ-USDT-SWAP'], '应从临时目录读取到预置持仓');
+    assert.deepEqual(r.out.legacyAtLoad, [{ instId: 'ZZZ-USDT-SWAP', strategy_id: 'rsi_dip', direction: 'long' }], '旧持仓补默认字段');
     // 写入也发生在临时目录
-    assert.ok(r.out.positionsFile && r.out.positionsFile.includes('AAA-USDT-SWAP'), 'sim 开仓后 positions.json 应写入临时目录');
+    const written = r.out.positionsFile?.positions?.map((p) => p.instId) || [];
+    assert.ok(written.includes('AAA-USDT-SWAP'), 'sim 开仓后 positions.json 应写入临时目录');
     assert.deepEqual(snapshotDir(REAL_DATA), before, '真实 server/data 不应有任何变化');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('冒烟（sim，无网络）：评估一轮 → RSI 低的币触发并模拟开仓；影子比对 0 不一致；复核通过；clamp 与策略 clamp 一致', () => {
+test('冒烟（sim，无网络）：bootstrap 历史翻转不算信号；新收盘的买入翻转 → 开多；旧持仓不被管理；clamp 与策略 clamp 一致', () => {
   const dir = mkdtempSync(join(tmpdir(), 'rsi-smoke-'));
   try {
+    writeFileSync(
+      join(dir, 'positions.json'),
+      JSON.stringify({ positions: [{ instId: 'ZZZ-USDT-SWAP', exec_mode: 'sim', entry_price: 1, amount: 10, leverage: 1, status: 'open' }] }),
+      'utf8'
+    );
     const port = 20000 + Math.floor(Math.random() * 20000);
-    const r = runChild({ RSI_NO_LISTEN: '1', RSI_DATA_DIR: dir, RSI_NO_ENV_LOCAL: '1', PORT: String(port), RSI_ENGINE_SHADOW: '1' });
+    const r = runChild({ RSI_NO_LISTEN: '1', RSI_DATA_DIR: dir, RSI_NO_ENV_LOCAL: '1', PORT: String(port) });
     assert.equal(r.status, 0, r.stderr);
     const o = r.out;
-    const aaa = o.signals.find((s) => s.instId === 'AAA-USDT-SWAP');
-    const bbb = o.signals.find((s) => s.instId === 'BBB-USDT-SWAP');
-    assert.equal(aaa.signal, true);
-    assert.equal(aaa.signalText, 'RSI 进入超卖区，触发买入！');
-    assert.equal(bbb.signal, false);
-    assert.equal(bbb.signalText, '未触发');
-    assert.deepEqual(o.positionsAfter.map((p) => p.instId), ['AAA-USDT-SWAP']);
-    assert.equal(o.positionsAfter[0].exec_mode, 'sim');
-    assert.equal(o.positionsAfter[0].tp, o.positionsAfter[0].entry * (1 + 8 / 100));
-    assert.equal(o.positionsAfter[0].sl, o.positionsAfter[0].entry * (1 - 6 / 100));
-    assert.equal(o.recheck.ok, true);
-    assert.equal(o.shadow.mismatches, 0, '影子比对应 0 不一致');
-    assert.ok(o.shadow.rows >= 2 && o.shadow.rechecks >= 1, '影子比对应确实执行过');
+    assert.deepEqual(o.cfg, { atr_period: 10, atr_multiplier: 3, atr_method: 'rma', allow_short: false, flip_only: true });
+    assert.deepEqual(o.afterBootstrap.signals, [], '启动 bootstrap 里的历史翻转不算信号');
+    assert.deepEqual(o.afterBootstrap.positions, ['ZZZ-USDT-SWAP'], '启动时不会按当前趋势入场（flip_only）');
+    const aaa = o.positionsAfter.find((p) => p.instId === 'AAA-USDT-SWAP');
+    assert.ok(aaa, 'bar 164 买入翻转后应开多');
+    assert.equal(aaa.direction, 'long');
+    assert.equal(aaa.strategy_id, 'supertrend');
+    assert.equal(aaa.exec_mode, 'sim');
+    assert.equal(aaa.tp, null, '无止盈');
+    assert.ok(Math.abs(aaa.sl - aaa.entry * 0.92) < 1e-9, '灾难止损 8%');
+    assert.equal(o.positionsAfter.some((p) => p.instId === 'BBB-USDT-SWAP'), false, '无翻转的币不开仓');
+    const legacy = o.positionsAfter.find((p) => p.instId === 'ZZZ-USDT-SWAP');
+    assert.equal(legacy.strategy_id, 'rsi_dip', '旧持仓不被 SuperTrend 接管或平仓');
     assert.deepEqual(o.clampMismatch, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -139,5 +146,5 @@ test('未设置 RSI_NO_LISTEN 时不导出测试钩子（现网路径无新增�
   const src = readFileSync(join(SERVER_DIR, 'index.js'), 'utf8');
   assert.match(src, /export const __test = NO_LISTEN/);
   assert.match(src, /process\.env\.RSI_NO_LISTEN === '1'/);
-  assert.match(src, /process\.env\.RSI_ENGINE_SHADOW === '1'/);
+  assert.doesNotMatch(src, /RSI_ENGINE_SHADOW/, '影子运行已随 RSI 移除');
 });

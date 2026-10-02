@@ -1,5 +1,5 @@
 /**
- * OKX 执行器（模拟盘 okx_demo / 实盘 okx_live）· USDT 永续多头 · 全仓
+ * OKX 执行器（模拟盘 okx_demo / 实盘 okx_live）· USDT 永续 多/空 · 全仓
  * - okx_demo：OKX_DEMO_* Key + x-simulated-trading: 1
  * - okx_live：OKX_LIVE_* Key，不带模拟盘头（真实资金）
  *
@@ -9,13 +9,19 @@
  *   3) 点差检查（对应环境 ticker）+ 余额检查 /api/v5/account/balance
  *   4) 首次或杠杆变化时 /api/v5/account/set-leverage（cross）
  *   5) 张数 = floor(保证金×杠杆 / (ctVal×价格) / lotSz) × lotSz，低于 minSz 则跳过
- *   6) 市价买入 /api/v5/trade/order（tdMode=cross，唯一 clOrdId，按 instId 加锁）
+ *   6) 市价开仓（多=buy / 空=sell，net 模式不带 posSide；tdMode=cross，唯一 clOrdId，按 instId 加锁）
  *   7) 查询订单 /api/v5/trade/order 获取 avgPx/accFillSz/fee
- *   8) 交易所端 OCO 止盈止损 /api/v5/trade/order-algo（ordType=oco，市价 -1）
+ *   8) 交易所端保护单 /api/v5/trade/order-algo（SuperTrend：仅灾难止损 conditional；旧 RSI 持仓：OCO；市价 -1）
  *      失败 → 立即市价平仓（fail-safe）
+ *
+ * 做空安全：openPosition 内断言 assertShortAllowed（RSI_ALLOW_SHORT / RSI_ALLOW_SHORT_LIVE），实盘默认禁止。
+ * 平仓/保护单一律 reduceOnly（net 模式），永远不会因平仓单反向穿仓。
  */
 import { OkxRestClient, OkxApiError } from './okxRest.js';
 import { pickCloseRecord, closeKeyOf } from './closeMatch.js';
+import { openSide, closeSide, stopLossPrice, takeProfitPrice, inferCloseAction, liqBreached, stopHit } from './engine/positionMath.js';
+import { matchExchangePos } from './engine/reconcileHelpers.js';
+import { assertShortAllowed } from './engine/shortGate.js';
 
 const INST_TTL_MS = 6 * 3600 * 1000;
 /** 实盘杠杆硬上限（后端强制） */
@@ -112,7 +118,6 @@ export class OkxExecutor {
     this.isLive = this.mode === 'okx_live';
     this.envText = this.isLive ? '实盘' : '模拟盘';
     this.tag = this.isLive ? '[实盘]' : '[模拟盘]';
-    this.buyTag = this.isLive ? '[实盘买入]' : '[模拟盘买入]';
     this.client = null;
     this.instruments = new Map();
     this.instLoadedAt = 0;
@@ -341,15 +346,20 @@ export class OkxExecutor {
     return { order: last, final: false };
   }
 
-  /** 读取交易所该合约的多头持仓（net 模式 pos>0 / 双向模式 posSide=long） */
-  async getExchangeLong(instId) {
+  /**
+   * 读取交易所该合约指定方向的持仓（net 模式按 pos 符号；双向模式按 posSide）。
+   * 返回 pos=绝对张数（恒为正）；signedPos 保留符号。无持仓返回 null。
+   */
+  async getExchangePosition(instId, direction = 'long') {
     const rows = await this.client.getPositions('SWAP', instId);
-    const longShort = this.isLongShort();
-    const r = (rows || []).find(
-      (p) => p.instId === instId && Number(p.pos) !== 0 && (longShort ? p.posSide === 'long' : p.posSide === 'net' && Number(p.pos) > 0)
-    );
-    if (!r) return null;
-    return { pos: Number(r.pos), avgPx: Number(r.avgPx), raw: r };
+    const m = matchExchangePos(rows, instId, direction === 'short' ? 'short' : 'long');
+    if (!m) return null;
+    return { pos: m.pos, signedPos: m.signedPos, direction: m.direction, avgPx: m.avgPx, liqPx: m.liqPx, raw: m.raw };
+  }
+
+  /** 兼容旧名：读取多头持仓 */
+  getExchangeLong(instId) {
+    return this.getExchangePosition(instId, 'long');
   }
 
   /** 按合约 lotSz 格式化张数 */
@@ -360,10 +370,17 @@ export class OkxExecutor {
   }
 
   /**
-   * 市价开多（完整流程：规格 → 点差 → 余额 → 张数 → 杠杆 → 下单 → 查成交 → OCO）
+   * 市价开仓（完整流程：做空断言 → 规格 → 点差 → 余额 → 张数 → 杠杆 → 复核 → 下单 → 查成交 → 灾难止损保护单）
+   * 多头 side=buy、参考卖一价；空头 side=sell、参考买一价。net 模式不带 posSide；双向模式带 posSide=direction。
    * @returns {Promise<{ok:true,pos:object}|{ok:false,skipped?:boolean,uncertain?:boolean,reason:string}>}
    */
-  async openLong({ instId, amount, leverage, tpPct, slPct, rsi, rsiClosed, maxSpreadPct, profile = 'demo', onSubmit, onPending, recheck }) {
+  async openPosition({
+    instId, direction = 'long', amount, leverage, tpPct = null, slPct = null, strategyId = 'supertrend', strategyVersion = 1,
+    signalMeta = null, maxSpreadPct, profile = 'demo', onSubmit, onPending, recheck,
+  }) {
+    const dir = direction === 'short' ? 'short' : 'long';
+    // 第 3 层做空断言（实盘默认拒绝；不依赖调用方是否做过检查）
+    assertShortAllowed(dir, this.mode);
     if (this.locks.has(instId)) return { ok: false, skipped: true, skipKind: 'lock', reason: `${instId} 正在下单中，跳过重复开仓` };
     this.locks.add(instId);
     try {
@@ -404,37 +421,52 @@ export class OkxExecutor {
         };
       }
 
-      // 张数
-      const size = calcContracts({ amount, leverage: lever, price: tk.askPx, ctVal: inst.ctVal, lotSz: inst.lotSz, minSz: inst.minSz });
+      // 张数：多头参考卖一价，空头参考买一价
+      const refPx = dir === 'long' ? tk.askPx : tk.bidPx;
+      const size = calcContracts({ amount, leverage: lever, price: refPx, ctVal: inst.ctVal, lotSz: inst.lotSz, minSz: inst.minSz });
       if (size.belowMin) {
         return {
           ok: false,
           skipped: true,
           skipKind: 'min_size',
           reason: `${instId} 计算张数 ${size.contractsStr} 低于最小下单量 ${inst.minSz} 张（每张 ${inst.ctVal} ${inst.ctValCcy} ≈ ${(
-            Number(inst.ctVal) * tk.askPx
+            Number(inst.ctVal) * refPx
           ).toFixed(2)} USDT），跳过`,
         };
       }
 
       await this.ensureLeverage(instId, lever);
 
-      // 下单前最后一次复核（实时 RSI 仍低于阈值、未急停、扫描仍在运行）
-      let rsiNow = rsi;
-      let rsiClosedNow = rsiClosed;
+      // 开仓前交易所实时持仓预检（R1 同币单仓）：该币在交易所已有任何非零持仓（任意方向）→ 拒绝，消除 20 秒对账窗口
+      try {
+        const rows = await this.client.getPositions('SWAP', instId);
+        const exist = matchExchangePos(rows, instId, null);
+        if (exist) {
+          return {
+            ok: false,
+            skipped: true,
+            skipKind: 'occupied',
+            reason: `${instId} 在${this.envText}已有${exist.direction === 'short' ? '空' : '多'}头持仓 ${exist.pos} 张（预检拒绝，避免净持仓被对冲/反转）`,
+          };
+        }
+      } catch (e) {
+        return { ok: false, skipped: true, skipKind: 'precheck', reason: `${instId} 开仓前持仓预检失败：${e.message}，放弃下单` };
+      }
+
+      // 下单前最后一次复核（信号仍成立、未急停、扫描仍在运行）
+      let metaNow = signalMeta;
       if (typeof recheck === 'function') {
         const rc = recheck();
         if (!rc?.ok) {
           return { ok: false, skipped: true, skipKind: 'recheck', reason: `${instId} 下单前复核未通过：${rc?.reason || '条件已变化'}，放弃下单` };
         }
-        if (rc.rsi != null) rsiNow = rc.rsi;
-        if (rc.rsiClosed !== undefined) rsiClosedNow = rc.rsiClosed;
+        if (rc.meta) metaNow = rc.meta;
       }
 
       const longShort = this.isLongShort();
-      const clOrdId = genId('rsio');
-      const body = { instId, tdMode: 'cross', side: 'buy', ordType: 'market', sz: size.contractsStr, clOrdId };
-      if (longShort) body.posSide = 'long';
+      const clOrdId = genId(dir === 'short' ? 'stso' : 'stlo');
+      const body = { instId, tdMode: 'cross', side: openSide(dir), ordType: 'market', sz: size.contractsStr, clOrdId };
+      if (longShort) body.posSide = dir;
       // 必须先持久化意图再发单。若落盘失败，回调会抛错并阻止真实订单发送。
       onPending?.({
         action: 'upsert',
@@ -442,18 +474,20 @@ export class OkxExecutor {
         instId,
         phase: 'prepared',
         clOrdId,
+        direction: dir,
+        strategy_id: strategyId,
+        strategy_version: strategyVersion,
+        signal_meta: metaNow ?? null,
         amount,
         leverage: lever,
-        tpPct,
-        slPct,
-        rsi: rsiNow ?? null,
-        rsiClosed: rsiClosedNow ?? null,
+        tpPct: tpPct ?? null,
+        slPct: slPct ?? null,
         profile,
         contractsStr: size.contractsStr,
-        referencePrice: tk.askPx,
+        referencePrice: refPx,
         createdAt: new Date().toISOString(),
       });
-      this.log('info', `${this.tag} 提交市价买入 ${instId} ${size.contractsStr} 张 | ${lever}x 全仓 | 参考卖一 ${tk.askPx} | clOrdId=${clOrdId}`);
+      this.log('info', `${this.tag} 提交市价${dir === 'long' ? '开多' : '开空'} ${instId} ${size.contractsStr} 张 | ${lever}x 全仓 | 参考${dir === 'long' ? '卖一' : '买一'} ${refPx} | clOrdId=${clOrdId}`);
       try {
         onSubmit?.();
       } catch {
@@ -488,20 +522,22 @@ export class OkxExecutor {
       let avgPx = Number(od?.avgPx || 0);
       const fee = Number(od?.fee || 0); // 负数 = 手续费支出
       const fillDec = decimalsOf(inst.lotSz);
+      let liqPx = null;
       if (!final) {
         this.log('warn', `${this.tag} ${instId} 订单 15 秒内未到终态（state=${od?.state || '未知'}，已成交 ${filled}/${size.contractsStr} 张），改用交易所持仓数量`);
       } else if (filled > 0 && Math.abs(filled - size.contracts) > 1e-9) {
         this.log('warn', `${this.tag} ${instId} 部分成交：${filled}/${size.contractsStr} 张（state=${od?.state}）`);
       }
-      // 以交易所持仓为准（张数 / 均价）
+      // 以交易所持仓为准（张数 / 均价）；净持仓下空头 pos<0，getExchangePosition 返回绝对张数
       try {
-        const ex = await this.getExchangeLong(instId);
+        const ex = await this.getExchangePosition(instId, dir);
         if (ex && ex.pos > 0) {
           if (Math.abs(ex.pos - filled) > 1e-9) {
             this.log('warn', `${this.tag} ${instId} 订单成交 ${filled} 张，交易所持仓 ${ex.pos} 张 → 以交易所持仓为准`);
           }
           filled = ex.pos;
           if (ex.avgPx > 0) avgPx = ex.avgPx;
+          liqPx = ex.liqPx;
         }
       } catch (e) {
         this.log('warn', `${this.tag} ${instId} 读取交易所持仓失败（暂用订单成交数据）：${e.message}`);
@@ -528,16 +564,22 @@ export class OkxExecutor {
         return { ok: false, uncertain: true, reason: `${instId} 市价单成交结果尚未明确（state=${od?.state || '未知'}），ordId=${ordId}` };
       }
 
+      const hasTp = Number(tpPct) > 0;
+      const hasSl = Number(slPct) > 0;
       const pos = {
         instId,
         exec_mode: this.mode,
+        direction: dir,
+        strategy_id: strategyId,
+        strategy_version: strategyVersion,
+        signal_meta: metaNow ?? null,
         simulated: false,
         external: false,
         entry_price: avgPx,
         amount: (filled * Number(inst.ctVal) * avgPx) / lever, // 实际保证金（按真实张数）
         leverage: lever,
         tdMode: 'cross',
-        posSide: longShort ? 'long' : 'net',
+        posSide: longShort ? dir : 'net',
         posMode: this.posMode,
         order_ccy: 'USDT',
         contracts: filled,
@@ -548,15 +590,14 @@ export class OkxExecutor {
         ordId,
         clOrdId,
         fee_open: fee,
+        liq_price: liqPx,
         algoId: null,
         algoClOrdId: null,
         tp_sl_attached: false,
-        take_profit_price: avgPx * (1 + tpPct / 100),
-        stop_loss_price: avgPx * (1 - slPct / 100),
-        tp_pct: tpPct,
-        sl_pct: slPct,
-        rsi_at_entry: rsiNow ?? null,
-        rsi_closed_at_entry: rsiClosedNow ?? null,
+        take_profit_price: hasTp ? takeProfitPrice(avgPx, tpPct, dir) : null,
+        stop_loss_price: hasSl ? stopLossPrice(avgPx, slPct, dir) : null,
+        tp_pct: hasTp ? tpPct : null,
+        sl_pct: hasSl ? slPct : null,
         amount_config: amount,
         at: new Date().toISOString(),
         opened_ts: Date.now(),
@@ -566,6 +607,9 @@ export class OkxExecutor {
         mode: 'swap',
         status: 'open',
       };
+      if (hasSl && liqPx && liqBreached({ sl: pos.stop_loss_price, liqPx, dir })) {
+        this.log('warn', `${this.tag} ${instId} 灾难止损价 ${pos.stop_loss_price} 越过强平价 ${liqPx}（${lever}x 杠杆偏高，可能先被强平）`);
+      }
       try {
         onPending?.({ action: 'upsert', exec_mode: this.mode, instId, phase: 'filled', clOrdId, ordId, pos });
       } catch (e) {
@@ -573,21 +617,21 @@ export class OkxExecutor {
       }
       this.log(
         'buy',
-        `${this.buyTag} ${instId} 持仓 ${pos.contractsStr} 张 @ 均价 ${avgPx} | ${lever}x 全仓 | 名义约 ${pos.notional_usdt.toFixed(2)} USDT | 手续费 ${fee} | 实时RSI=${fmtRsi(
-          rsiNow
-        )} 收盘RSI=${fmtRsi(rsiClosedNow)}`
+        `${this.tag}[${dir === 'long' ? '开多' : '开空'}] ${instId} 持仓 ${pos.contractsStr} 张 @ 均价 ${avgPx} | ${lever}x 全仓 | 名义约 ${pos.notional_usdt.toFixed(2)} USDT | 手续费 ${fee} | 策略 ${strategyId}`
       );
 
-      // 交易所端 OCO 止盈止损；失败则 fail-safe 立即平仓
-      try {
-        await this.placeProtection(pos, tpPct, slPct);
-      } catch (e) {
-        this.log('error', `${this.tag} ${instId} 止盈止损委托失败：${e.message} → 触发保护，立即市价平仓`);
-        pos.close_reason = 'failsafe';
+      // 交易所端保护单（灾难止损；旧 RSI 持仓为 OCO）；失败则 fail-safe 立即平仓
+      if (hasSl || hasTp) {
         try {
-          await this.marketClose(pos, 'failsafe');
-        } catch (e2) {
-          this.log('error', `${this.tag} ${instId} 保护性平仓也失败：${e2.message}（请立即在 OKX ${this.envText}手动处理！）`);
+          await this.placeProtection(pos, hasTp ? tpPct : null, hasSl ? slPct : null);
+        } catch (e) {
+          this.log('error', `${this.tag} ${instId} 保护单（灾难止损）委托失败：${e.message} → 触发保护，立即市价平仓`);
+          pos.close_reason = 'failsafe';
+          try {
+            await this.marketClose(pos, 'failsafe');
+          } catch (e2) {
+            this.log('error', `${this.tag} ${instId} 保护性平仓也失败：${e2.message}（请立即在 OKX ${this.envText}手动处理！）`);
+          }
         }
       }
       try {
@@ -601,38 +645,44 @@ export class OkxExecutor {
     }
   }
 
+  /** 该持仓是否需要交易所保护单（SuperTrend：灾难止损>0；旧 RSI 持仓：止盈或止损>0） */
+  needsProtection(pos) {
+    return Number(pos?.sl_pct) > 0 || Number(pos?.tp_pct) > 0;
+  }
+
   /**
-   * 为持仓挂交易所端 OCO（止盈+止损，触发后市价平多）
-   * 优先 closeFraction='1'（官方文档：SWAP、oco/conditional、市价 -1 时可用，全仓位平仓，不传 sz；net 模式须 reduceOnly=true），
-   * 若被拒则回退为 sz = 交易所持仓张数。
+   * 为持仓挂交易所端保护单（触发后市价平仓，方向取反、reduceOnly）：
+   *  - 仅止损（SuperTrend 灾难止损）：ordType=conditional；止盈+止损（旧 RSI 持仓）：ordType=oco
+   * 优先 closeFraction='1'（SWAP、市价 -1、全仓位平仓，不传 sz；net 模式须 reduceOnly=true），被拒则回退为 sz = 持仓张数。
+   * tpPct / slPct 传 null 或 0 表示该侧不挂。
    */
   async placeProtection(pos, tpPct, slPct) {
+    const dir = pos.direction === 'short' ? 'short' : 'long';
+    const hasTp = Number(tpPct) > 0;
+    const hasSl = Number(slPct) > 0;
+    if (!hasTp && !hasSl) return pos; // 无需保护（灾难止损已关闭）
     let inst = this.getInst(pos.instId);
     if (!inst) {
       await this.loadInstruments();
       inst = this.getInst(pos.instId);
     }
-    if (!inst) throw new Error(`${pos.instId} 无合约规格，无法挂止盈止损`);
-    const tp = roundToTick(pos.entry_price * (1 + tpPct / 100), inst.tickSz);
-    const sl = roundToTick(pos.entry_price * (1 - slPct / 100), inst.tickSz);
+    if (!inst) throw new Error(`${pos.instId} 无合约规格，无法挂保护单`);
+    const tp = hasTp ? roundToTick(takeProfitPrice(pos.entry_price, tpPct, dir), inst.tickSz) : null;
+    const sl = hasSl ? roundToTick(stopLossPrice(pos.entry_price, slPct, dir), inst.tickSz) : null;
     const base = {
       instId: pos.instId,
       tdMode: 'cross',
-      side: 'sell',
-      ordType: 'oco',
-      tpTriggerPx: tp.str,
-      tpOrdPx: '-1',
-      tpTriggerPxType: 'last',
-      slTriggerPx: sl.str,
-      slOrdPx: '-1',
-      slTriggerPxType: 'last',
+      side: closeSide(dir),
+      ordType: hasTp && hasSl ? 'oco' : 'conditional',
     };
-    if (pos.posSide === 'long') base.posSide = 'long'; // 开平仓模式：sell + long = 平多
+    if (tp) Object.assign(base, { tpTriggerPx: tp.str, tpOrdPx: '-1', tpTriggerPxType: 'last' });
+    if (sl) Object.assign(base, { slTriggerPx: sl.str, slOrdPx: '-1', slTriggerPxType: 'last' });
+    if (pos.posSide === 'long' || pos.posSide === 'short') base.posSide = pos.posSide; // 开平仓模式：反向单 + posSide = 平该方向
     else base.reduceOnly = true; // 买卖模式：只减仓（closeFraction 要求）
 
     let r = null;
     let mode = 'closeFraction';
-    let algoClOrdId = genId('rsit');
+    let algoClOrdId = genId('stt');
     let cfErr = null;
     try {
       const rows = await this.client.placeAlgoOrder({ ...base, closeFraction: '1', algoClOrdId });
@@ -653,9 +703,9 @@ export class OkxExecutor {
       }
     }
     if (!r?.algoId) {
-      this.log('warn', `${this.tag} ${pos.instId} closeFraction=1 全仓止盈止损未成功（${cfErr?.message || '未返回 algoId'}）→ 改用 sz=${pos.contractsStr} 张`);
+      this.log('warn', `${this.tag} ${pos.instId} closeFraction=1 全仓保护单未成功（${cfErr?.message || '未返回 algoId'}）→ 改用 sz=${pos.contractsStr} 张`);
       mode = 'sz';
-      algoClOrdId = genId('rsit');
+      algoClOrdId = genId('stt');
       const rows = await this.client.placeAlgoOrder({ ...base, sz: pos.contractsStr, algoClOrdId });
       r = rows?.[0] || {};
       if (!r.algoId) throw new Error('未返回 algoId');
@@ -666,13 +716,15 @@ export class OkxExecutor {
     pos.algo_sz = mode === 'sz' ? pos.contractsStr : null;
     pos.tp_sl_attached = true;
     pos.tp_sl_full = true;
-    pos.take_profit_price = tp.value;
-    pos.stop_loss_price = sl.value;
-    pos.tp_pct = tpPct;
-    pos.sl_pct = slPct;
+    pos.take_profit_price = tp ? tp.value : null;
+    pos.stop_loss_price = sl ? sl.value : null;
+    pos.tp_pct = hasTp ? tpPct : null;
+    pos.sl_pct = hasSl ? slPct : null;
     this.log(
       'info',
-      `${this.tag} ${pos.instId} 已挂交易所 OCO（${mode === 'closeFraction' ? '全仓位 closeFraction=1' : `sz=${pos.contractsStr} 张`}）：止盈 ${tp.str} / 止损 ${sl.str}（触发后市价）algoId=${r.algoId}`
+      `${this.tag} ${pos.instId} 已挂交易所${hasTp && hasSl ? ' OCO' : hasSl ? '灾难止损单' : '止盈单'}（${mode === 'closeFraction' ? '全仓位 closeFraction=1' : `sz=${pos.contractsStr} 张`}）：${
+        tp ? `止盈 ${tp.str} ` : ''
+      }${sl ? `止损 ${sl.str} ` : ''}（${dir === 'long' ? '多' : '空'}头，触发后市价）algoId=${r.algoId}`
     );
     return pos;
   }
@@ -690,12 +742,13 @@ export class OkxExecutor {
     }
   }
 
-  /** 市价平掉该合约的全部多仓（张数以交易所持仓为准；只减仓，不会反向开空） */
+  /** 市价平掉该合约的全部持仓（方向取自 pos.direction；张数以交易所持仓为准；reduceOnly，不会反向开仓） */
   async marketClose(pos, reason = 'manual') {
+    const dir = pos.direction === 'short' ? 'short' : 'long';
     try {
       if (!this.accountConfig) await this.refreshAccountConfig();
       await this.loadInstruments();
-      const ex = await this.getExchangeLong(pos.instId);
+      const ex = await this.getExchangePosition(pos.instId, dir);
       if (ex && ex.pos > 0 && Math.abs(ex.pos - Number(pos.contracts)) > 1e-9) {
         this.log('warn', `${this.tag} ${pos.instId} 平仓张数按交易所持仓修正：${pos.contracts} → ${ex.pos}`);
         pos.contracts = ex.pos;
@@ -708,12 +761,12 @@ export class OkxExecutor {
     const body = {
       instId: pos.instId,
       tdMode: 'cross',
-      side: 'sell',
+      side: closeSide(dir),
       ordType: 'market',
       sz: pos.contractsStr,
-      clOrdId: genId('rsic'),
+      clOrdId: genId('stc'),
     };
-    if (pos.posSide === 'long') body.posSide = 'long';
+    if (pos.posSide === 'long' || pos.posSide === 'short') body.posSide = pos.posSide;
     else body.reduceOnly = true;
     const requestedContracts = Number(pos.contracts) || 0;
     const r = await this._placeOrderIdempotent(body);
@@ -726,7 +779,7 @@ export class OkxExecutor {
     pos.close_last_submitted_at = Date.now();
     pos.close_next_retry_at = Date.now() + Math.min(5 * 60 * 1000, 15000 * Math.pow(2, Math.min(pos.close_attempts - 1, 5)));
     pos.close_last_error = null;
-    this.log('sell', `${this.tag} 已提交市价平仓 ${pos.instId} ${pos.contractsStr} 张（原因：${reasonText(reason)}）ordId=${r.ordId}`);
+    this.log('sell', `${this.tag} 已提交市价平${dir === 'long' ? '多' : '空'} ${pos.instId} ${pos.contractsStr} 张（原因：${reasonText(reason)}）ordId=${r.ordId}`);
 
     let waited = { order: null, final: false };
     try {
@@ -737,7 +790,7 @@ export class OkxExecutor {
     const filled = Number(waited.order?.accFillSz || 0);
     let remaining = null;
     try {
-      const after = await this.getExchangeLong(pos.instId);
+      const after = await this.getExchangePosition(pos.instId, dir);
       remaining = after?.pos > 0 ? Number(after.pos) : 0;
       if (remaining > 0) {
         pos.contracts = remaining;
@@ -754,7 +807,8 @@ export class OkxExecutor {
         `${this.tag} ${pos.instId} 平仓尚未完成（已成交 ${filled}/${requestedContracts} 张，剩余 ${remaining == null ? '待确认' : remaining}），保留保护并自动重试`
       );
     }
-    return { ...r, final: waited.final, filled, remaining, complete };
+    const closeAvgPx = Number(waited.order?.avgPx) || null;
+    return { ...r, final: waited.final, filled, remaining, complete, closeAvgPx };
   }
 
   fetchPositions() {
@@ -770,8 +824,9 @@ export class OkxExecutor {
    * @returns {Promise<null|object>}
    */
   async resolveClose(pos, usedKeys = new Set()) {
+    const dir = pos.direction === 'short' ? 'short' : 'long';
     const rows = await this.client.getPositionsHistory({ instType: 'SWAP', instId: pos.instId, limit: '20' });
-    // 只匹配本仓位开仓之后、且未被其它仓位使用过的平仓记录；找不到则返回 null（下轮重试）
+    // 只匹配本仓位开仓之后、且未被其它仓位使用过的、同方向的平仓记录；找不到则返回 null（下轮重试）
     const h = pickCloseRecord(rows, pos, usedKeys);
     if (!h) return null;
 
@@ -780,6 +835,7 @@ export class OkxExecutor {
     const type = String(h.type || '');
     if (pos.close_reason === 'kill') action = 'kill';
     else if (pos.close_reason === 'failsafe') action = 'failsafe';
+    else if (pos.close_reason === 'flip') action = 'flip';
     else if (type === '3' || type === '4') action = 'liq';
     else if (pos.algoId) {
       try {
@@ -793,7 +849,9 @@ export class OkxExecutor {
     const closeAvgPx = Number(h.closeAvgPx);
     if (!action) {
       inferred = true;
-      action = Number.isFinite(closeAvgPx) && closeAvgPx >= pos.entry_price ? 'tp' : 'sl';
+      if (Number(pos.tp_pct) > 0 && Number.isFinite(closeAvgPx)) action = inferCloseAction(pos.entry_price, closeAvgPx, dir);
+      else if (Number(pos.stop_loss_price) > 0 && Number.isFinite(closeAvgPx) && stopHit(closeAvgPx, Number(pos.stop_loss_price), dir)) action = 'sl';
+      else action = 'external';
     }
     return {
       closeAvgPx,
@@ -813,15 +871,12 @@ export class OkxExecutor {
   }
 }
 
-function fmtRsi(v) {
-  return v != null && Number.isFinite(Number(v)) ? Number(v).toFixed(2) : '—';
-}
-
 export function reasonText(r) {
   return (
     {
       tp: '止盈',
-      sl: '止损',
+      sl: '止损（灾难止损）',
+      flip: '信号反手平仓',
       kill: '急停平仓',
       failsafe: '保护性平仓',
       manual: '手动',

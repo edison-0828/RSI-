@@ -1,4 +1,4 @@
-// 阶段 1：positionMath（仅做多）—— 与改造前 index.js / pnl.js / executor.js 中的旧表达式逐位（Object.is）比对
+// positionMath（多空）：多头分支与改造前 index.js / pnl.js / executor.js 中的旧表达式逐位（Object.is）比对
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as pm from '../engine/positionMath.js';
@@ -47,21 +47,61 @@ test('positionMath：做多分支与旧表达式 Object.is 逐位一致（随机
   }
 });
 
-test('positionMath：方向与买卖方向（阶段 1 仅做多；做空明确拒绝）', () => {
+test('positionMath：方向与买卖方向（多空）', () => {
   assert.equal(pm.sign(), 1);
   assert.equal(pm.sign('long'), 1);
+  assert.equal(pm.sign('short'), -1);
   assert.equal(pm.openSide('long'), 'buy');
   assert.equal(pm.closeSide('long'), 'sell');
-  for (const fn of [pm.sign, pm.openSide, pm.closeSide, (d) => pm.profitPct(1, 2, d), (d) => pm.takeProfitPrice(1, 1, d), (d) => pm.stopLossPrice(1, 1, d), (d) => pm.inferCloseAction(1, 2, d)]) {
-    assert.throws(() => fn('short'), /仅支持做多/);
-  }
+  assert.equal(pm.openSide('short'), 'sell');
+  assert.equal(pm.closeSide('short'), 'buy');
+  assert.equal(pm.oppositeDir('long'), 'short');
+  assert.equal(pm.oppositeDir('short'), 'long');
+  assert.equal(pm.dirText('short'), '空');
+  assert.equal(pm.dirText('long'), '多');
+  // 非法方向仍然抛错（不允许悄悄当作多头）
+  assert.throws(() => pm.sign('up'));
 });
 
-test('positionMath：手算样例', () => {
+test('positionMath：多头手算样例', () => {
   assert.equal(pm.takeProfitPrice(100, 8), 108);
   assert.equal(pm.stopLossPrice(100, 6), 94);
   assert.equal(pm.profitPct(100, 110), 10);
   assert.equal(pm.profitPct(100, 90), -10);
+});
+
+test('positionMath：空头手算样例（价格下跌为正收益；止损价在上方；止损触发方向相反）', () => {
+  assert.equal(pm.profitPct(100, 90, 'short'), 10);
+  assert.equal(pm.profitPct(100, 110, 'short'), -10);
+  assert.equal(pm.takeProfitPrice(100, 8, 'short'), 92);
+  assert.equal(pm.stopLossPrice(100, 8, 'short'), 108);
+  assert.deepEqual(pm.tpSlPrices(100, 8, 6, 'short'), { tp: 92, sl: 106 });
+  assert.equal(pm.stopHit(108, 108, 'short'), true);
+  assert.equal(pm.stopHit(107.9, 108, 'short'), false);
+  assert.equal(pm.stopHit(92, 92, 'long'), true);
+  assert.equal(pm.stopHit(92.1, 92, 'long'), false);
+  assert.equal(pm.inferCloseAction(100, 90, 'short'), 'tp');
+  assert.equal(pm.inferCloseAction(100, 110, 'short'), 'sl');
+  // 强平价：多在下方、空在上方
+  assert.ok(Math.abs(pm.estLiqPrice(100, 10, 'long') - 90.5) < 1e-9);
+  assert.ok(Math.abs(pm.estLiqPrice(100, 10, 'short') - 109.5) < 1e-9);
+  assert.equal(pm.liqBreached({ sl: 95, liqPx: 90.5, dir: 'long' }), false);
+  assert.equal(pm.liqBreached({ sl: 90, liqPx: 90.5, dir: 'long' }), true);
+  assert.equal(pm.liqBreached({ sl: 110, liqPx: 109.5, dir: 'short' }), true);
+});
+
+test('positionMath：simRoundTrip 含手续费的往返盈亏（手算）', () => {
+  // 多：名义 1000，100 → 110，单边费率 0.05%：毛 100；开仓费 0.5；平仓名义 1100 → 费 0.55；净 98.95
+  const L = pm.simRoundTrip({ notional: 1000, entry: 100, exit: 110, dir: 'long', feePct: 0.05 });
+  assert.equal(L.pct, 10);
+  assert.ok(Math.abs(L.gross - 100) < 1e-9 && Math.abs(L.feeOpen - 0.5) < 1e-9 && Math.abs(L.feeClose - 0.55) < 1e-9 && Math.abs(L.net - 98.95) < 1e-9);
+  // 空：100 → 90：毛 +100；平仓名义 900 → 费 0.45；净 99.05
+  const S = pm.simRoundTrip({ notional: 1000, entry: 100, exit: 90, dir: 'short', feePct: 0.05 });
+  assert.equal(S.pct, 10);
+  assert.ok(Math.abs(S.gross - 100) < 1e-9 && Math.abs(S.feeClose - 0.45) < 1e-9 && Math.abs(S.net - 99.05) < 1e-9);
+  // 空头价格上涨 → 亏损
+  const S2 = pm.simRoundTrip({ notional: 1000, entry: 100, exit: 105, dir: 'short', feePct: 0 });
+  assert.ok(Math.abs(S2.net + 50) < 1e-9);
 });
 
 test('normalize：旧记录补 strategy_id=rsi_dip / direction=long，保留未知字段，不改入参', () => {

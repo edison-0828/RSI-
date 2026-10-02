@@ -8,6 +8,7 @@ import { dirname, join } from 'path';
 import { usedKeysFromTrades } from './closeMatch.js';
 import { resolveDataDir } from './dataDir.js';
 import { profitPct as calcProfitPct } from './engine/positionMath.js';
+import { withStrategyDefaults, backupOnce } from './engine/normalize.js';
 
 // 数据目录：RSI_DATA_DIR（新）优先，其次 RSI_BOTTOM_HUNTER_DATA_DIR（旧），否则 server/data
 const DATA_DIR = resolveDataDir();
@@ -40,11 +41,16 @@ function loadOne(L) {
       return;
     }
     const raw = JSON.parse(readFileSync(L.path, 'utf8'));
-    L.trades = Array.isArray(raw?.trades) ? raw.trades : [];
+    // 旧账本升级：读时补 strategy_id=rsi_dip / direction=long（旧版只可能开多，side 已是 'long'）；首次写盘前备份 *.bak-pre-v2
+    const rawTrades = Array.isArray(raw?.trades) ? raw.trades : [];
+    L.needsBackup = rawTrades.some((t) => t && (t.strategy_id == null || t.direction == null));
+    L.trades = rawTrades.map((t) => withStrategyDefaults(t));
     // 旧账本没有 riskEvents 时，用现存交易补建；之后清空展示历史不会再影响风控累计。
     L.riskEvents = Array.isArray(raw?.riskEvents)
-      ? raw.riskEvents
+      ? raw.riskEvents.map((e) => withStrategyDefaults(e))
       : L.trades.map((t) => ({
+          strategy_id: t.strategy_id,
+          direction: t.direction,
           id: t.id,
           exec_mode: t.exec_mode || 'sim',
           closed_at: t.closed_at,
@@ -64,6 +70,10 @@ export function loadLedger() {
 
 function saveOne(L) {
   try {
+    if (L.needsBackup) {
+      backupOnce(L.path); // 升级到 v2 前的一次性备份（不覆盖已有备份）
+      L.needsBackup = false;
+    }
     const dir = dirname(L.path);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const tmp = `${L.path}.tmp`;
@@ -97,10 +107,10 @@ function riskEventsOf(execMode) {
 }
 
 /**
- * @param {object} pos
+ * @param {object} pos 持仓（direction: long|short；strategy_id）
  * @param {number} exitPrice
- * @param {'tp'|'sl'|'manual'|'kill'|'failsafe'|'liq'|'external'} action
- * @param {number} profitPct
+ * @param {'tp'|'sl'|'flip'|'manual'|'kill'|'failsafe'|'liq'|'external'} action  flip=SuperTrend 信号反手/平仓
+ * @param {number} profitPct 方向调整后的价格收益率 %（空头价格下跌为正）
  * @param {object} [extra] 真实成交数据（OKX 模拟盘/实盘）：
  *   { pnl_usdt 已实现盈亏(含手续费/资金费), fee_usdt, funding_fee_usdt, gross_pnl_usdt, estimated, inferred, contracts }
  */
@@ -116,18 +126,25 @@ export function recordClose(pos, exitPrice, action, profitPct, extra = {}) {
   const exact = extra && Number.isFinite(Number(extra.pnl_usdt)) && extra.pnl_usdt !== null && extra.pnl_usdt !== undefined;
   const pnlUsdt = exact ? Number(extra.pnl_usdt) : estPnl;
   const execMode = pos.exec_mode || 'sim';
+  const direction = pos.direction === 'short' ? 'short' : 'long';
   const trade = {
-    id: `${Date.now()}-${pos.instId}-${action}`,
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${pos.instId}-${action}`,
     instId: pos.instId,
     action,
-    side: 'long',
+    side: direction, // 兼容旧字段：等于 direction（旧账本恒为 long）
+    direction,
+    strategy_id: pos.strategy_id || 'rsi_dip',
+    strategy_version: pos.strategy_version ?? null,
+    signal_meta: pos.signal_meta ?? null,
+    sim_slippage_pct: Number.isFinite(Number(extra?.sim_slippage_pct)) ? Number(extra.sim_slippage_pct) : null,
+    fee_open_usdt: Number.isFinite(Number(extra?.fee_open_usdt)) ? Number(extra.fee_open_usdt) : null,
     entry_price: entry,
     exit_price: exit,
     amount,
     leverage,
     profit_pct: pct,
     pnl_usdt: pnlUsdt,
-    pnl_exact: !!exact && !extra.estimated,
+    pnl_exact: !!exact && !extra.estimated && !extra.sim,
     fee_usdt: Number.isFinite(Number(extra?.fee_usdt)) ? Number(extra.fee_usdt) : null,
     funding_fee_usdt: Number.isFinite(Number(extra?.funding_fee_usdt)) ? Number(extra.funding_fee_usdt) : null,
     gross_pnl_usdt: Number.isFinite(Number(extra?.gross_pnl_usdt)) ? Number(extra.gross_pnl_usdt) : null,
@@ -148,6 +165,8 @@ export function recordClose(pos, exitPrice, action, profitPct, extra = {}) {
   if (L.trades.length > MAX_TRADES) L.trades.length = MAX_TRADES;
   L.riskEvents.unshift({
     id: trade.id,
+    strategy_id: trade.strategy_id,
+    direction,
     exec_mode: execMode,
     closed_at: trade.closed_at,
     pnl_usdt: pnlUsdt,
@@ -228,7 +247,7 @@ export function buildPnLDashboard(openPositions = [], execMode) {
       p.profit_pct != null
         ? Number(p.profit_pct)
         : entry > 0 && Number.isFinite(price)
-          ? calcProfitPct(entry, price)
+          ? calcProfitPct(entry, price, p.direction === 'short' ? 'short' : 'long')
           : 0;
     if (!Number.isFinite(pct)) pct = 0;
     // OKX 模拟盘/实盘持仓优先使用交易所返回的未实现盈亏 upl
@@ -237,6 +256,8 @@ export function buildPnLDashboard(openPositions = [], execMode) {
     unrealized += pnl;
     openRows.push({
       instId: p.instId,
+      direction: p.direction === 'short' ? 'short' : 'long',
+      strategy_id: p.strategy_id || 'rsi_dip',
       amount,
       leverage,
       entry_price: entry,
@@ -260,7 +281,24 @@ export function buildPnLDashboard(openPositions = [], execMode) {
       ? closed.filter((t) => (t.pnl_usdt || 0) < 0).reduce((s, t) => s + t.pnl_usdt, 0) / losses
       : 0;
 
+  const group = (keyFn) => {
+    const g = {};
+    for (const t of closed) {
+      const k = keyFn(t);
+      const x = (g[k] ||= { trades: 0, wins: 0, losses: 0, realized_usdt: 0 });
+      const pnl = Number(t.pnl_usdt) || 0;
+      x.trades++;
+      x.realized_usdt += pnl;
+      if (pnl > 0) x.wins++;
+      else if (pnl < 0) x.losses++;
+    }
+    for (const x of Object.values(g)) x.win_rate_pct = x.wins + x.losses > 0 ? (x.wins / (x.wins + x.losses)) * 100 : null;
+    return g;
+  };
+
   return {
+    by_strategy: group((t) => t.strategy_id || 'rsi_dip'),
+    by_direction: group((t) => (t.direction === 'short' ? 'short' : 'long')),
     exec_mode: execMode || null,
     exec_mode_text: execMode ? EXEC_MODE_TEXT[execMode] || execMode : '全部',
     is_live: execMode === 'okx_live',

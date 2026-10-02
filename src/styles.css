@@ -2861,3 +2861,43 @@ body {
     padding: 18px 12px;
   }
 }
+
+/* ── SuperTrend：趋势芯片 / 多空徽章 ── */
+.rsi-chip.up,
+.rsi-mobile.up { color: #34d399; }
+.rsi-chip.up {
+  min-width: 64px;
+  border-color: rgba(52, 211, 153, 0.38);
+  background: rgba(52, 211, 153, 0.1);
+}
+.rsi-chip.down,
+.rsi-mobile.down { color: #fda4af; }
+.rsi-chip.down {
+  min-width: 64px;
+  border-color: rgba(251, 113, 133, 0.38);
+  background: rgba(251, 113, 133, 0.11);
+}
+.legend-dot.up { background: var(--green); box-shadow: 0 0 8px rgba(52, 211, 153, 0.42); }
+
+.dir-badge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.dir-badge.long {
+  color: #34d399;
+  border-color: rgba(52, 211, 153, 0.4);
+  background: rgba(52, 211, 153, 0.1);
+}
+.dir-badge.short {
+  color: #fda4af;
+  border-color: rgba(251, 113, 133, 0.4);
+  background: rgba(251, 113, 133, 0.11);
+}

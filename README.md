@@ -1,14 +1,27 @@
-# RSI抄底宝 · 全市场扫描
+# SuperTrend 翻转交易 · 全市场扫描
 
-按前端 `mode` 扫描 OKX USDT 现货/永续：成交量过滤 → 批量 RSI → demo 模拟买卖。
+按前端 `mode` 扫描 OKX USDT 现货/永续：成交量过滤 → 15 分钟 K 线 SuperTrend → 趋势翻转即平仓并反手（可多可空）。
+
+> 本项目由原「RSI抄底宝」改造而来，RSI 逻辑已移除（改造前代码备份见使用者本机备份目录）。
 
 ## 项目简介
 
-RSI抄底宝是一款基于 RSI（相对强弱指标）的量化交易系统，支持全市场扫描并自动识别超卖信号进行抄底交易。系统支持三种执行模式：
+策略以 TradingView Pine v4「SuperTrend」为准（`atr = changeATR ? atr(Periods) : sma(tr, Periods)`，`src = hl2`，`up/dn` 带 `close[1]` 判定，`trend` 初值 1，判定用 `up1/dn1`）：
 
-- **本地模拟**：完全模拟交易，永不下单
-- **OKX 模拟盘**：使用 OKX 模拟盘账户进行交易
-- **OKX 实盘**：使用真实资金进行交易（需谨慎）
+- **买入翻转**（trend 由 -1 → 1）：平空（若有）并开多；
+- **卖出翻转**（trend 由 1 → -1）：平多（若有）并开空；
+- 只在**已收盘**的 K 线上判定；启动时历史上的翻转不算信号；同一次翻转只处理一次（落盘去重）；
+- 默认只做多：做空需要三层开关全部放行（见下），做空被拦时持多遇卖出翻转仍会平多；
+- 灾难止损（默认 8%）只是兜底：模拟盘按价格检查，交易所端挂 conditional 算法单；正常出场靠信号翻转；
+- 灾难止损 / 强平后该币对本策略冷却 60 分钟；信号平仓、手动平仓、急停不冷却。
+
+三种执行模式：
+
+- **本地模拟**（含滑点与手续费、强平价估算）
+- **OKX 模拟盘**
+- **OKX 实盘**（真实资金，谨慎）
+
+> 本次改造仅在**本地模拟**下做了端到端验证；OKX 模拟盘 / 实盘路径（含做空、反手、conditional 灾难止损单）已写好但**未经真实交易所验证**。
 
 ## 技术栈
 
@@ -32,16 +45,59 @@ npm run dev
 ## 使用方法
 
 1. 选择交易模式（现货 `spot` / 永续 `swap`）与配置文件（默认 `demo`）
-2. 设置参数：最小成交额、Universe 上限、RSI 阈值、金额、最大持仓
+2. 设置参数：最小成交额、Universe 上限、ATR 周期 / 倍数 / 方法、灾难止损、是否允许做空、金额、最大持仓
 3. 点击「开始全市场扫描」
 
 ## 默认参数
 
 | 参数 | 默认值 |
 |------|--------|
-| minVolUsd24h（24小时成交量） | 1,000,000 USDT |
-| universeLimit（扫描币种数量） | 40（UI 可调 10–100） |
-| scanConcurrency（扫描并发数） | 4 |
+| minVolUsd24h（24小时成交量） | 300,000 USDT |
+| universeLimit（扫描币种数量） | 120（最大 200） |
+| scanConcurrency（扫描并发数） | 6 |
+
+## 策略参数（`/api/scan/start` 与界面「策略设置」）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| bar | 15m | K 线周期，只在已收盘 K 线判定 |
+| atr_period | 10 | ATR 周期（Pine 的 Periods） |
+| atr_multiplier | 3 | ATR 倍数（Pine 的 Multiplier） |
+| atr_method | rma | `rma` = Pine `atr()`；`sma` = `sma(tr, Periods)`（Pine 的 changeATR=false） |
+| disaster_stop_pct | 8 | 灾难止损 %，0 = 关闭 |
+| allow_short | false | 策略层做空开关（还需环境变量放行） |
+| flip_only | true | 只在翻转时入场；false 时无仓位按当前趋势入场 |
+| disaster_cooldown_minutes | 60 | 灾难止损 / 强平后冷却 |
+| signal_max_age_sec | 300 | 翻转超过此时间才处理时只平不开 |
+| sim_fee_pct / sim_slippage_pct | 0.05 / 0.031 | 本地模拟单边手续费 / 滑点 |
+| warmup_bars | 150 | 启动预热所需 K 线数 |
+
+默认 `mode=swap`。现货模式不支持做空。
+
+## 做空与反手：三层开关（默认全部关闭）
+
+1. 服务端环境变量 `RSI_ALLOW_SHORT=1`（本地模拟 / OKX 模拟盘放行）；**实盘另需** `RSI_ALLOW_SHORT_LIVE=1`；
+2. 策略参数 `allow_short=true`（界面「允许做空」）；实盘启动检查弹窗还要再输入「确认做空」（接口字段 `short_confirm_text`）；
+3. 执行层 `assertShortAllowed` 断言兜底（即使上层 bug 也不会真的下空单）。
+
+环境变量必须是真实进程环境变量（`.env.local` 里的不算）。
+
+## 旧版 RSI 持仓的处理
+
+升级后首次加载 `positions.json` 时，旧持仓会补上 `strategy_id=rsi_dip`、`direction=long`（并先备份为 `*.bak-pre-v2`）。这些仓位：
+
+- SuperTrend **不会**对其开 / 平 / 反手（界面标「旧策略·只对账」）；
+- 仍计入最大持仓数与「同币单仓」占用；
+- 继续对账，并维护交易所上的 OCO 保护单，由交易所止盈 / 止损平仓，平仓后照常入账；
+- 冷却仍走旧的止损冷却逻辑。
+
+## 信号回放（离线）
+
+```bash
+node scripts/replay-signals.mjs --file <K线文件> [--coin BTC-USDT-SWAP] [--period 10] [--mult 3] [--method rma|sma] [--limit 700]
+```
+
+只读文件，不联网、不下单、不碰 `server/data`。输出 JSONL（每行一次翻转），汇总写 stderr。
 
 ## 执行方式
 
@@ -85,11 +141,12 @@ npm run dev
 
 ### 模拟盘交易流程
 
-1. **开仓**：市价买入（全仓、唯一 clOrdId）
+1. **开仓**：市价开多（buy）/ 开空（sell）（全仓、net 模式、唯一 clOrdId）
 2. **查询成交均价**
-3. **止盈止损**：在交易所端设置 OCO 订单（若失败则市价平仓）
-4. **对账**：每 20 秒与交易所同步持仓/止盈止损/平仓记录
-5. **持仓存储**：`server/data/positions.json`
+3. **灾难止损**：交易所端挂 conditional 算法单（reduceOnly，全仓平仓；若失败则市价平仓）
+4. **反手**：先平后开，两笔订单
+5. **对账**：每 20 秒与交易所同步持仓/止盈止损/平仓记录
+6. **持仓存储**：`server/data/positions.json`
 
 ### 风控机制
 
@@ -113,7 +170,7 @@ npm run dev
 
 ### 日志
 
-重要日志（warn/error/buy/sell/tp/sl）追加写入 `server/data/events.log`（JSON 格式，按行存储，20MB 轮转）
+重要日志（warn/error/buy/sell/flip/sl 等）追加写入 `server/data/events.log`（JSON 格式，按行存储，20MB 轮转）
 
 ## OKX 实盘配置
 
@@ -168,7 +225,7 @@ npm run dev
 - `RSI_DATA_DIR`：把 `server/data` 重定向到其它目录（旧变量 `RSI_BOTTOM_HUNTER_DATA_DIR` 仍然有效，新变量优先）
 - `RSI_NO_ENV_LOCAL=1`：不读取 `server/.env.local`
 - `RSI_NO_LISTEN=1`：import `server/index.js` 时不监听端口、不启动对账定时器（务必同时设置 `RSI_DATA_DIR`）
-- `RSI_ENGINE_SHADOW=1`：影子运行，仅比对“旧判断 vs 策略 evaluate”，不一致写 `[回归]` 警告日志，不影响下单
+- `RSI_ALLOW_SHORT=1` / `RSI_ALLOW_SHORT_LIVE=1`：做空放行开关（见上文，默认均不设置）
 
 策略接口说明见 `server/strategies/README.md`。
 
@@ -186,12 +243,19 @@ npm run dev
 │   ├── okxWs.js           # OKX WebSocket
 │   ├── pnl.js             # 盈亏计算
 │   ├── candleStore.js     # K线数据存储
-│   ├── strategies/        # 策略接口、注册表、RSI 抄底策略
-│   ├── engine/            # 持仓数学、信号适配等引擎纯函数
+│   ├── strategies/        # 策略接口、注册表、SuperTrend 策略
+│   ├── engine/            # SuperTrend 计算、持仓数学（多空）、反手规划、做空开关等纯函数
 │   └── env.js             # 环境变量
+├── scripts/               # replay-signals.mjs 离线回放等
 ├── package.json           # 项目配置
 └── vite.config.ts         # Vite 配置
 ```
+
+## 升级 / 回滚注意
+
+- 改动后需**重启 API**（8787）才生效；重启前确认没有正在运行的扫描；`npm run build` 会重写 `dist/`。
+- 升级会把 `positions.json` / `pnl-ledger.json` / `cooldowns.json` 迁移为 v2 格式（首次写盘前各备份一份 `*.bak-pre-v2`）。
+- 回滚到旧版前，请确认没有空头持仓（`positions.json` 里 `has_short=true` 表示存在）：旧版不识别空头。
 
 ## 许可证
 

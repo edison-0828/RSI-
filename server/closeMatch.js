@@ -6,6 +6,7 @@
  * 新逻辑：
  *  - 平仓记录的 cTime（仓位创建时间）必须在本仓位开仓（成交）时间附近，uTime（平仓时间）必须在开仓之后
  *  - 开仓均价与本仓位入场价偏差过大的记录排除
+ *  - 方向必须一致（pos.direction；缺省 long）：先多后空（反手）时不会把上一笔多头的平仓记录误配给空头
  *  - 已被其它仓位（账本）使用过的记录（close_key）不再使用
  *  - 多条候选时取开仓之后最早的一条
  */
@@ -46,6 +47,8 @@ export function usedKeysFromTrades(trades = []) {
  */
 export function pickCloseRecord(rows, pos, usedKeys = new Set(), opts = {}) {
   const { openSkewMs = 20000, closeSkewMs = 1000, maxEntryDiffPct = 1 } = opts;
+  // 方向：取持仓的 direction（缺省 long，兼容旧持仓）。OKX 净持仓下 positions-history 的 direction 为 long/short，posSide 为 net
+  const dir = pos?.direction === 'short' ? 'short' : 'long';
   // 交易所开仓订单创建时间 order_cts（毫秒，交易所时钟）优先；旧持仓没有则用本地 opened_ts / at
   const fillTs = Number(pos?.order_cts) || 0;
   const localTs = Number(pos?.opened_ts) || (pos?.at ? Date.parse(pos.at) : 0) || 0;
@@ -54,7 +57,7 @@ export function pickCloseRecord(rows, pos, usedKeys = new Set(), opts = {}) {
   const entry = Number(pos?.entry_price);
   const cand = (rows || [])
     .filter((r) => r && (r.instId ? r.instId === pos.instId : true))
-    .filter((r) => r.direction === 'long' || r.posSide === 'long')
+    .filter((r) => r.direction === dir || r.posSide === dir)
     .filter((r) => {
       const u = Number(r.uTime);
       const c = Number(r.cTime);

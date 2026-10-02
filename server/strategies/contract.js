@@ -18,10 +18,10 @@
  */
 /**
  * @typedef {Object} Strategy
- * @property {string}   id            全局唯一，如 'rsi_dip'（将写入 positions / 账本 / 冷却）
+ * @property {string}   id            全局唯一，如 'supertrend'（将写入 positions / 账本 / 冷却）
  * @property {string}   name          展示名
  * @property {number}   version       逻辑版本；改动信号语义必须 +1
- * @property {Direction[]} directions 该策略可能产生的方向（rsi_dip: ['long']）
+ * @property {Direction[]} directions 该策略可能产生的方向（supertrend: ['long','short']）
  * @property {ParamField[]} params    参数声明
  * @property {Array<object>} presets  快速预设（可为空数组）
  * @property {(raw:object)=>object} clamp      参数夹紧并补默认值
@@ -34,8 +34,9 @@
  * @property {'scan'|'recheck'} phase   recheck = 下单前复核
  * @property {object} params            本策略已夹紧的参数
  * @property {{price:number|null, bid:number|null, ask:number|null,
- *             closes:number[], forming:{ts:number,close:number}|null, bars:number, barMs:number,
- *             ind?:{rsi?:number|null, rsiForming?:number|null}}} market
+ *             bars:number, barMs:number, lastBarTs:number|null,
+ *             st?:{ready:boolean, readyBars:number, trend:(1|-1|null), up:number|null, dn:number|null, atr:number|null,
+ *                  flip:{ts:number,dir:'long'|'short',closeAt:number,close:number}|null, trendSince:number|null}}} market
  * @property {{tradable:boolean}} flags tradable=false：例如 okx_demo 下该币模拟盘不存在
  */
 /**

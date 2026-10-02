@@ -11,6 +11,7 @@ const t = mod.__test;
 out.hasHook = !!t;
 out.dataDir = t.DATA_DIR;
 out.positionsAtLoad = [...t.positions.keys()];
+out.legacyAtLoad = [...t.positions.values()].map((p) => ({ instId: p.instId, strategy_id: p.strategy_id, direction: p.direction }));
 
 // 1) 端口：PORT 由父进程指定；若 import 时已监听，则这里 bind 会失败（EADDRINUSE）
 const port = Number(process.env.PORT);
@@ -20,53 +21,40 @@ out.portFree = await new Promise((resolve) => {
   s.listen(port, '127.0.0.1', () => s.close(() => resolve(true)));
 });
 
-// 2) 构造行情：一个“RSI 很低”的币，一个“未触发”的币
-const bootstrap = (instId, closesOldToNew) => {
-  const t0 = 1_790_000_000_000;
-  const candles = closesOldToNew.map((c, i) => [t0 + i * 900_000, c, c, c, c, 1, 1, 1, '1']).reverse(); // 最新在前
-  t.candleStore.bootstrap(instId, candles);
-};
-const falling = [];
-let px = 100;
-for (let i = 0; i < 60; i++) {
-  px = px * (i % 7 === 6 ? 1.004 : 0.985);
-  falling.push(px);
-}
-const flatUp = [];
-for (let i = 0; i < 60; i++) flatUp.push(100 + i * 0.1);
-t.candleStore.setPeriod(6);
-bootstrap('AAA-USDT-SWAP', falling);
-bootstrap('BBB-USDT-SWAP', flatUp);
+// 2) 构造行情：AAA = 合成走势（bar 103 卖出翻转、bar 164 买入翻转）；BBB = 单边缓涨（无翻转）
+import { closes as synth, candle, T0, BAR } from './stSeries.mjs';
+const closesA = synth();
+const closesB = closesA.map((_, i) => 100 + i * 0.1);
+const boot = 150; // bootstrap 前 150 根：历史中的 bar 103 卖出翻转不算信号
+t.setNow(() => T0 + boot * BAR + 5_000);
+const cfg = t.startScanForTest({ exec_mode: 'sim', mode: 'swap', max_positions: 3, amount: 10, leverage: 2, warmup_bars: 20, disaster_stop_pct: 8, sim_fee_pct: 0, sim_slippage_pct: 0 });
+out.cfg = { atr_period: cfg.atr_period, atr_multiplier: cfg.atr_multiplier, atr_method: cfg.atr_method, allow_short: cfg.allow_short, flip_only: cfg.flip_only };
+const load = (id, cl) => t.candleStore.bootstrap(id, Array.from({ length: boot }, (_, i) => candle(i, cl[i])).reverse());
+load('AAA-USDT-SWAP', closesA);
+load('BBB-USDT-SWAP', closesB);
 t.setUniverseForTest([
-  { instId: 'AAA-USDT-SWAP', volUsd24h: 1e6, price: falling[falling.length - 1] },
-  { instId: 'BBB-USDT-SWAP', volUsd24h: 1e6, price: flatUp[flatUp.length - 1] },
+  { instId: 'AAA-USDT-SWAP', volUsd24h: 1e6, price: closesA[boot - 1] },
+  { instId: 'BBB-USDT-SWAP', volUsd24h: 1e6, price: closesB[boot - 1] },
 ]);
-const cfg = t.startScanForTest({ exec_mode: 'sim', mode: 'swap', rsi_period: 6, rsi_buy_threshold: 20, max_positions: 3, amount: 10, leverage: 2 });
-out.cfgRsiBuyThreshold = cfg.rsi_buy_threshold;
-
-// 3) 评估一轮：AAA 应触发并在 sim 下开仓；BBB 不触发
 t.evaluateSignals({ quiet: false });
+out.afterBootstrap = { positions: [...t.positions.keys()], signals: t.getSignalsForTest().filter((s) => s.signal).map((s) => s.instId) };
+for (let i = boot; i < 170; i++) {
+  t.setNow(() => T0 + (i + 1) * BAR + 5_000);
+  t.candleStore.applyCandle('AAA-USDT-SWAP', candle(i, closesA[i]));
+  t.candleStore.applyCandle('BBB-USDT-SWAP', candle(i, closesB[i]));
+  t.evaluateSignals({ quiet: true });
+}
 const sigs = t.getSignalsForTest();
-out.signals = sigs.map((r) => ({ instId: r.instId, signal: r.signal, signalText: r.signalText, rsi: r.rsi }));
-out.positionsAfter = [...t.positions.values()].map((p) => ({ instId: p.instId, exec_mode: p.exec_mode, entry: p.entry_price, tp: p.take_profit_price, sl: p.stop_loss_price }));
-out.recheck = t.recheckBuyCondition('AAA-USDT-SWAP', 'sim');
-out.shadow = { ...t.shadowStats };
-out.positionsFile = existsSync(join(t.DATA_DIR, 'positions.json')) ? JSON.parse(readFileSync(join(t.DATA_DIR, 'positions.json'), 'utf8')).positions.map((p) => p.instId) : null;
-
-// 4) clampConfig 的策略相关字段 与 rsiDip.clamp 一致（旧 payload）
+out.signals = sigs.map((r) => ({ instId: r.instId, signal: r.signal, trend: r.trend, flipDir: r.flipDir, held: r.held, signalText: r.signalText }));
+out.positionsAfter = [...t.positions.values()].map((p) => ({ instId: p.instId, exec_mode: p.exec_mode, direction: p.direction, strategy_id: p.strategy_id, sl: p.stop_loss_price, tp: p.take_profit_price, entry: p.entry_price }));
+out.positionsFile = existsSync(join(t.DATA_DIR, 'positions.json')) ? JSON.parse(readFileSync(join(t.DATA_DIR, 'positions.json'), 'utf8')) : null;
+// clampConfig 的策略字段与策略 clamp 一致
 const { getStrategy } = await import('../../strategies/index.js');
-const dip = getStrategy('rsi_dip');
-const payloads = [
-  {},
-  { rsi_period: 14, rsi_buy_threshold: 25, confirm_on_close: true },
-  { rsi_period: '9', rsi_buy_threshold: '0', take_profit_pct: 0, stop_loss_pct: 'x', bb_filter_enabled: true, bb_period: 500, bb_mult: -1 },
-  { exec_mode: 'okx_live', bb_filter_enabled: 'true', bb_period: 1, bb_mult: 99, confirm_on_close: 'true', bar: '1H' },
-  { rsi_period: 1, confirm_on_close: 1, bb_filter_enabled: 1, bb_period: 30.6, bb_mult: 2.25 },
-];
+const st = getStrategy('supertrend');
 out.clampMismatch = [];
-for (const p of payloads) {
+for (const p of [{}, { atr_period: 7, atr_multiplier: 2, atr_method: 'sma' }, { atr_period: '0', atr_multiplier: 'x', disaster_stop_pct: 999, allow_short: 'true', flip_only: false }, { exec_mode: 'okx_live', bar: '1H' }]) {
   const c = t.clampConfig(p);
-  const d = dip.clamp(c);
-  for (const k of Object.keys(d)) if (!Object.is(c[k], d[k])) out.clampMismatch.push({ payload: p, key: k, cfg: c[k], dip: d[k] });
+  const d = st.clamp(c);
+  for (const k of Object.keys(d)) if (!Object.is(c[k], d[k])) out.clampMismatch.push({ payload: p, key: k, cfg: c[k], st: d[k] });
 }
 console.log('@@JSON@@' + JSON.stringify(out));

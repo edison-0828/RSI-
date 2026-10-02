@@ -28,19 +28,19 @@ test('开仓响应未明确时保留 pending，避免同币重复下单', async 
   const events = [];
   ex._placeOrderIdempotent = async () => ({ ordId: 'order-1' });
   ex._waitFill = async () => ({ order: { state: 'live', accFillSz: '0', avgPx: '' }, final: false });
-  ex.getExchangeLong = async () => null;
+  ex.getExchangePosition = async () => null;
+  ex.client.getPositions = async () => []; // 开仓前预检：交易所无该币持仓
 
-  const result = await ex.openLong({
+  const result = await ex.openPosition({
     instId: 'BTC-USDT-SWAP',
+    direction: 'long',
     amount: 100,
     leverage: 2,
-    tpPct: 8,
-    slPct: 6,
-    rsi: 18,
-    rsiClosed: 19,
+    tpPct: null,
+    slPct: 8,
     maxSpreadPct: 0.3,
     onPending: (event) => events.push(event),
-    recheck: () => ({ ok: true, rsi: 18, rsiClosed: 19 }),
+    recheck: () => ({ ok: true }),
   });
 
   assert.equal(result.uncertain, true);
@@ -51,7 +51,7 @@ test('开仓响应未明确时保留 pending，避免同币重复下单', async 
 test('部分平仓会记录剩余数量并进入可重试 closing 状态', async () => {
   const { ex } = preparedExecutor();
   let queryCount = 0;
-  ex.getExchangeLong = async () => {
+  ex.getExchangePosition = async () => {
     queryCount++;
     return queryCount === 1
       ? { pos: 10, avgPx: 100 }

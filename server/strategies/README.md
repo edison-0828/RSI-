@@ -13,14 +13,14 @@
 
 ## 文件
 - `contract.js`：类型说明 + `validateStrategy` / `validateDecision`
-- `index.js`：注册表 `registerStrategy / getStrategy / listStrategies / evaluateSafely`（内置 `rsi_dip`）
-- `rsiDip.js`：RSI 抄底（含可选布林带下轨过滤、可选收盘确认）。逐行对应改造前 `index.js` 的现网语句；`bbFilter.js` 未改动
+- `index.js`：注册表 `registerStrategy / getStrategy / listStrategies / evaluateSafely`（只注册 `supertrend`）
+- `superTrend.js`：SuperTrend 翻转策略（Pine v4 语义，ATR 支持 RMA / SMA）；计算在 `../engine/superTrendCalc.js`。只在已收盘 K 线给出翻转信号，bootstrap 历史翻转不算信号
 - 引擎侧适配在 `../engine/signalAdapter.js`（CandleStore 快照 → `EvalCtx`；`Decision` → 信号行字段 / 复核返回值）
 
-## 环境变量（阶段 0 / 1，均默认关闭 = 现网行为）
+## 环境变量（均默认关闭）
 | 变量 | 作用 |
 |---|---|
 | `RSI_DATA_DIR` | 数据目录（positions / cooldowns / events.log / pnl-ledger）。优先于旧变量 `RSI_BOTTOM_HUNTER_DATA_DIR`（旧变量继续生效）。必须是真实进程环境变量 |
 | `RSI_NO_ENV_LOCAL=1` | 不读取 `server/.env.local`（不加载任何 Key） |
 | `RSI_NO_LISTEN=1` | import `server/index.js` 时不监听端口、不启动 20 秒对账定时器；同时导出 `__test` 钩子（仅测试 / 演练）。仍会读取数据目录，所以必须同时设 `RSI_DATA_DIR` |
-| `RSI_ENGINE_SHADOW=1` | 影子运行：信号评估 / 下单前复核时，同时用改造前的旧判断（`engine/legacyShadow.js`）比对策略结果；不一致只写 `[回归]` 警告日志，绝不影响信号与下单 |
+| `RSI_ALLOW_SHORT=1` | 放行做空（本地模拟 / OKX 模拟盘）；实盘另需 `RSI_ALLOW_SHORT_LIVE=1`；还需策略参数 `allow_short=true`，执行层再断言兜底 |

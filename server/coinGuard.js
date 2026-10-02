@@ -21,7 +21,8 @@ export const GUARD_DEFAULTS = Object.freeze({
   sl_filter_hours: 24,
 });
 
-const KIND_TEXT = { normal: '普通止损', severe: '严重止损', streak: '连续止损' };
+const KIND_TEXT = { normal: '普通止损', severe: '严重止损', streak: '连续止损', disaster: '灾难止损' };
+export const DEFAULT_GUARD_STRATEGY = 'rsi_dip'; // 旧冷却条目（无 strategy_id）归入此策略；key = mode|strategy_id|instId
 const MODE_TEXT = { sim: '本地模拟', okx_demo: 'OKX 模拟盘', okx_live: 'OKX 实盘' };
 const LONG_MS = 365 * 24 * 3600 * 1000;
 
@@ -61,19 +62,19 @@ export class CoinGuard {
     this.path = path;
     this.log = log;
     this.now = now;
-    /** key(mode|instId) -> { instId, exec_mode, slTimes:number[], cooldown:null|{until,kind,reason,at,lossPct} } */
+    /** key(mode|strategy_id|instId) -> { instId, exec_mode, slTimes:number[], cooldown:null|{until,kind,reason,at,lossPct} } */
     this.map = new Map();
   }
 
-  static key(mode, instId) {
-    return `${mode || 'sim'}|${instId}`;
+  static key(mode, instId, strategyId = DEFAULT_GUARD_STRATEGY) {
+    return `${mode || 'sim'}|${strategyId || DEFAULT_GUARD_STRATEGY}|${instId}`;
   }
 
-  _get(mode, instId, create = false) {
-    const k = CoinGuard.key(mode, instId);
+  _get(mode, instId, create = false, strategyId = DEFAULT_GUARD_STRATEGY) {
+    const k = CoinGuard.key(mode, instId, strategyId);
     let g = this.map.get(k);
     if (!g && create) {
-      g = { instId, exec_mode: mode || 'sim', slTimes: [], cooldown: null };
+      g = { instId, exec_mode: mode || 'sim', strategy_id: strategyId || DEFAULT_GUARD_STRATEGY, slTimes: [], cooldown: null };
       this.map.set(k, g);
     }
     return g || null;
@@ -107,9 +108,9 @@ export class CoinGuard {
   }
 
   /** 窗口内止损次数 */
-  slCount(mode, instId, cfgRaw) {
+  slCount(mode, instId, cfgRaw, strategyId = DEFAULT_GUARD_STRATEGY) {
     const cfg = clampGuardCfg(cfgRaw);
-    const g = this._get(mode, instId);
+    const g = this._get(mode, instId, false, strategyId);
     if (!g) return 0;
     const cut = this.now() - this._windowMs(cfg);
     return g.slTimes.filter((t) => t > cut).length;
@@ -123,12 +124,12 @@ export class CoinGuard {
    * @param {{ lossPct?: number, at?: number, liq?: boolean }} info lossPct=价格变动%（负数为亏损，不含杠杆）
    * @returns {{ kind:string, until:number, reason:string, count:number }|null}
    */
-  onStopLoss(mode, instId, cfgRaw, { lossPct = null, at = null, liq = false } = {}) {
+  onStopLoss(mode, instId, cfgRaw, { lossPct = null, at = null, liq = false, strategyId = DEFAULT_GUARD_STRATEGY } = {}) {
     const cfg = clampGuardCfg(cfgRaw);
     const now = this.now();
     let t = Number(at);
     if (!Number.isFinite(t) || t <= 0 || t > now) t = now;
-    const g = this._get(mode, instId, true);
+    const g = this._get(mode, instId, true, strategyId);
     const cut = now - this._windowMs(cfg);
     g.slTimes = g.slTimes.filter((x) => x > cut);
     g.slTimes.push(t);
@@ -181,6 +182,28 @@ export class CoinGuard {
   }
 
   /**
+   * 信号出场策略（SuperTrend）专用：灾难止损触发 / 强平后，该币对该策略冷却 minutes 分钟（信号平仓不冷却）。
+   * 已有更长的冷却不会被缩短。minutes<=0 表示不冷却。
+   * @returns {{kind:string, until:number, reason:string}|null}
+   */
+  onDisasterStop(mode, instId, { strategyId, minutes = 60, at = null, lossPct = null, liq = false } = {}) {
+    const mins = Number(minutes);
+    if (!(mins > 0)) return null;
+    const now = this.now();
+    let t = Number(at);
+    if (!Number.isFinite(t) || t <= 0 || t > now) t = now;
+    const g = this._get(mode, instId, true, strategyId);
+    const until = t + mins * 60 * 1000;
+    const reason = `${liq ? '强平' : '灾难止损触发'}${Number.isFinite(Number(lossPct)) ? `（价格 ${Number(lossPct).toFixed(2)}%）` : ''}，冷却 ${mins} 分钟`;
+    const cur = g.cooldown && g.cooldown.until > now ? g.cooldown : null;
+    if (until > now && (!cur || until > cur.until)) g.cooldown = { kind: 'disaster', until, reason, at: t, lossPct: Number.isFinite(Number(lossPct)) ? Number(lossPct) : null };
+    this.save();
+    const tag = `[冷却]${MODE_TEXT[mode] ? `[${MODE_TEXT[mode]}]` : ''}`;
+    this.log('warn', `${tag} ${instId} ${reason}，至 ${new Date(g.cooldown?.until || until).toLocaleString('zh-CN', { hour12: false })}`);
+    return g.cooldown ? { kind: g.cooldown.kind, until: g.cooldown.until, reason: g.cooldown.reason } : null;
+  }
+
+  /**
    * 首次启用（无状态文件）时，按账本里近期的止损/强平记录补建冷却，避免升级重启后立刻重复开刚止损的币
    * @param {object[]} trades 账本记录（任意顺序）
    * @returns {number} 补建后生效中的冷却数量
@@ -198,7 +221,7 @@ export class CoinGuard {
     this.log = () => {};
     try {
       for (const { t, at } of list) {
-        this.onStopLoss(t.exec_mode || 'sim', t.instId, cfg, { lossPct: Number(t.profit_pct), at, liq: t.action === 'liq' });
+        this.onStopLoss(t.exec_mode || 'sim', t.instId, cfg, { lossPct: Number(t.profit_pct), at, liq: t.action === 'liq', strategyId: t.strategy_id || DEFAULT_GUARD_STRATEGY });
       }
     } finally {
       this.log = log;
@@ -213,8 +236,8 @@ export class CoinGuard {
   }
 
   /** 查询冷却：null 表示可开仓 */
-  check(mode, instId) {
-    const g = this._get(mode, instId);
+  check(mode, instId, strategyId = DEFAULT_GUARD_STRATEGY) {
+    const g = this._get(mode, instId, false, strategyId);
     if (!g || !g.cooldown) return null;
     const now = this.now();
     if (g.cooldown.until <= now) {
@@ -242,9 +265,10 @@ export class CoinGuard {
       out.push({
         instId: g.instId,
         exec_mode: g.exec_mode,
+        strategy_id: g.strategy_id || DEFAULT_GUARD_STRATEGY,
         kind: g.cooldown.kind,
         kindText: kindText(g.cooldown.kind),
-        streak: this.slCount(g.exec_mode, g.instId, cfgRaw),
+        streak: this.slCount(g.exec_mode, g.instId, cfgRaw, g.strategy_id),
         filteredUntil: new Date(g.cooldown.until).toISOString(),
         remainingMs: g.cooldown.until - now,
         remainingText: remainingText(g.cooldown.until - now),
@@ -257,12 +281,13 @@ export class CoinGuard {
     return out;
   }
 
-  /** 手动解除：instId 为空则全部；mode 为空则所有模式。同时清空该币窗口内止损次数 */
-  clear(instId = null, mode = null) {
+  /** 手动解除：instId 为空则全部；mode / strategyId 为空则所有模式 / 所有策略。同时清空该币窗口内止损次数 */
+  clear(instId = null, mode = null, strategyId = null) {
     let n = 0;
     for (const [k, g] of [...this.map.entries()]) {
       if (instId && g.instId !== instId) continue;
       if (mode && g.exec_mode !== mode) continue;
+      if (strategyId && (g.strategy_id || DEFAULT_GUARD_STRATEGY) !== strategyId) continue;
       this.map.delete(k);
       n++;
     }
@@ -273,7 +298,8 @@ export class CoinGuard {
   toJSON() {
     return {
       updatedAt: new Date(this.now()).toISOString(),
-      items: [...this.map.values()].map((g) => ({ instId: g.instId, exec_mode: g.exec_mode, slTimes: g.slTimes, cooldown: g.cooldown })),
+      version: 2,
+      items: [...this.map.values()].map((g) => ({ instId: g.instId, exec_mode: g.exec_mode, strategy_id: g.strategy_id || DEFAULT_GUARD_STRATEGY, slTimes: g.slTimes, cooldown: g.cooldown })),
     };
   }
 
@@ -299,10 +325,12 @@ export class CoinGuard {
       for (const it of Array.isArray(raw?.items) ? raw.items : []) {
         if (!it || !it.instId) continue;
         const mode = it.exec_mode || 'sim';
+        const sid = it.strategy_id || DEFAULT_GUARD_STRATEGY; // 旧条目缺 strategy_id → rsi_dip
         const cd = it.cooldown && Number.isFinite(Number(it.cooldown.until)) ? { ...it.cooldown, until: Number(it.cooldown.until) } : null;
-        this.map.set(CoinGuard.key(mode, it.instId), {
+        this.map.set(CoinGuard.key(mode, it.instId, sid), {
           instId: it.instId,
           exec_mode: mode,
+          strategy_id: sid,
           slTimes: (Array.isArray(it.slTimes) ? it.slTimes : []).map(Number).filter((t) => Number.isFinite(t) && t > 0),
           cooldown: cd,
         });

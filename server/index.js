@@ -1,25 +1,38 @@
 /**
- * RSI抄底宝 — 全市场扫描后端
- * Universe（CLI filter/tickers）→ REST/CLI K 线 bootstrap → 本地 Wilder RSI
- * → OKX WebSocket 实时 K 线 + tickers 驱动更新（不再轮询 market indicator rsi）
+ * SuperTrend 翻转反手多空自动交易系统 — 全市场扫描后端
+ * Universe（CLI filter/tickers）→ REST K 线 bootstrap（~300 根 15m）→ 本地 SuperTrend（只在已收盘K线上增量计算）
+ * → OKX WebSocket 实时 K 线 + tickers 驱动 → 翻转即平仓并反手（始终持仓），灾难止损兜底
  */
 import express from 'express';
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFile, statSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { calcRsi } from './rsi.js';
 import { CandleStore } from './candleStore.js';
 import { recordClose, clearTrades, buildPnLDashboard, todayRealized, usedCloseKeys, listTrades } from './pnl.js';
-import { CoinGuard, clampGuardCfg, GUARD_DEFAULTS } from './coinGuard.js';
-import { BB_DEFAULTS, clampBbCfg } from './bbFilter.js';
+import { CoinGuard, GUARD_DEFAULTS } from './coinGuard.js';
 import { OkxWsManager, barToCandleChannel } from './okxWs.js';
 import { loadEnvLocal } from './env.js';
 import { resolveDataDir, dataDirOverridden } from './dataDir.js';
 import { getStrategy, evaluateSafely } from './strategies/index.js';
-import { ctxFromStore, rowFieldsFromDecision, recheckResultFromDecision } from './engine/signalAdapter.js';
-import { legacyEvaluateRow, legacyRecheck } from './engine/legacyShadow.js';
-import { profitPct as posProfitPct, takeProfitPrice as longTpPrice, stopLossPrice as longSlPrice, inferCloseAction } from './engine/positionMath.js';
+import { SUPERTREND_DEFAULTS } from './strategies/superTrend.js';
+import { ctxFromStore } from './engine/signalAdapter.js';
+import {
+  profitPct as posProfitPct,
+  takeProfitPrice,
+  stopLossPrice,
+  inferCloseAction,
+  stopHit,
+  openSide,
+  closeSide,
+  dirText,
+  simRoundTrip,
+  estLiqPrice,
+} from './engine/positionMath.js';
+import { withStrategyDefaults, backupOnce, needsUpgrade, isManagedPosition, ACTIVE_STRATEGY_ID, SCHEMA_VERSION } from './engine/normalize.js';
+import { planFlip } from './engine/flipPlanner.js';
+import { shortBlockReason, shortEnvFlags, shortEnvBlockReason, assertShortAllowed } from './engine/shortGate.js';
+import { classifyPosition, matchExchangePos, exchangeRowDirection } from './engine/reconcileHelpers.js';
 import { OkxExecutor, demoKeysConfigured, liveKeysConfigured, keysConfiguredFor, reasonText, LIVE_MAX_LEVERAGE } from './executor.js';
 import { createLocalAccess } from './localAuth.js';
 
@@ -27,12 +40,9 @@ import { createLocalAccess } from './localAuth.js';
 // RSI_NO_ENV_LOCAL=1 时不读取 .env.local（测试 / 回放 / 升级演练用）
 const envLoad = loadEnvLocal();
 
-// ---------- 运行开关（阶段 0/1，均为环境变量，默认全部关闭 = 现网行为） ----------
+// ---------- 运行开关（均为环境变量，默认全部关闭） ----------
 /** RSI_NO_LISTEN=1：import 本模块时不监听端口、不启动对账定时器（仅用于测试 / 演练） */
 const NO_LISTEN = process.env.RSI_NO_LISTEN === '1';
-/** RSI_ENGINE_SHADOW=1：影子运行。每次信号评估 / 下单前复核，同时用改造前的旧判断代码比对策略 evaluate 的结果，
- *  不一致只写 [回归] 警告日志，绝不改变信号、下单、止盈止损（默认关闭） */
-const ENGINE_SHADOW = process.env.RSI_ENGINE_SHADOW === '1';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -40,7 +50,8 @@ const PORT = Number(process.env.PORT || 8787);
 const MAX_LOG = 300; // 内存日志缓冲
 const STATUS_LOG_LIMIT = 200; // /api/scan/status 返回最近条数
 const OKX_REST = 'https://www.okx.com';
-const CANDLE_BOOTSTRAP_LIMIT = 100;
+/** 启动时每币拉取的 15m K 线根数（OKX /market/candles 单次最多 300） */
+const CANDLE_BOOTSTRAP_LIMIT = 300;
 
 const app = express();
 const extraOrigins = String(process.env.LOCAL_UI_ORIGINS || '')
@@ -247,13 +258,24 @@ async function mapPool(items, concurrency, worker) {
 
 // ---------- Defaults ----------
 const DEFAULT_SCAN = {
-  mode: 'spot',
+  mode: 'swap',
   profile: 'demo',
-  bar: '15m',
-  rsi_period: 6,
-  rsi_buy_threshold: 20,
-  take_profit_pct: 8,
-  stop_loss_pct: 6,
+  // SuperTrend 策略参数（KivancOzbilgic 标准版；允许做空默认关闭）
+  bar: SUPERTREND_DEFAULTS.bar,
+  atr_period: SUPERTREND_DEFAULTS.atr_period,
+  atr_multiplier: SUPERTREND_DEFAULTS.atr_multiplier,
+  atr_method: SUPERTREND_DEFAULTS.atr_method,
+  disaster_stop_pct: SUPERTREND_DEFAULTS.disaster_stop_pct, // 灾难止损：入场价反向 N%，0=关闭
+  allow_short: SUPERTREND_DEFAULTS.allow_short, // 策略层做空开关（另有服务端环境变量硬开关 RSI_ALLOW_SHORT）
+  flip_only: SUPERTREND_DEFAULTS.flip_only, // 仅翻转入场（不在启动时按当前趋势入场）
+  warmup_bars: SUPERTREND_DEFAULTS.warmup_bars,
+  // 灾难止损触发 / 强平后，该币对本策略冷却（分钟）；信号平仓不冷却
+  disaster_cooldown_minutes: 60,
+  // 翻转信号有效期（秒）：超时的信号只平仓、不入场 / 不反手（防止断线重连后追高追低）
+  signal_max_age_sec: 300,
+  // 本地模拟成交成本：单边 taker 手续费 % 与每笔市价成交滑点 %（沿用回测口径 0.05 / 0.031）
+  sim_fee_pct: 0.05,
+  sim_slippage_pct: 0.031,
   max_positions: 5,
   amount: 100,
   // 执行方式：sim=本地模拟（默认，永不下单）；okx_demo=OKX 模拟盘真实下单；okx_live=OKX 实盘（真实资金）。后两者仅永续
@@ -262,29 +284,14 @@ const DEFAULT_SCAN = {
   daily_loss_limit_usdt: 50,
   max_orders_per_hour: 10,
   max_spread_pct: 0.3,
-  // 需收盘确认：额外要求最近已收盘 K 线 RSI 也低于阈值（默认关闭）
-  confirm_on_close: false,
-  // 布林带下轨过滤（默认关闭）：打开后要求 RSI 已触发 且 实时价 < 下轨（扫描周期、bb_period 根、bb_mult 倍总体标准差）
-  bb_filter_enabled: BB_DEFAULTS.bb_filter_enabled,
-  bb_period: BB_DEFAULTS.bb_period,
-  bb_mult: BB_DEFAULTS.bb_mult,
-  // 永续专用（现货忽略）：固定多头 + 全仓 + USDT 下单，杠杆可选
+  // 永续专用（现货忽略，且现货不能做空）：全仓 + USDT 下单，杠杆可选
   leverage: 1,
   tdMode: 'cross',
-  posSide: 'long',
   order_ccy: 'USDT',
   minVolUsd24h: 300_000,
   universeLimit: 120,
   scanConcurrency: 6,
   refreshSec: 60,
-  // 同币冷却：滚动窗口（sl_filter_hours 小时）内止损达 max_consecutive_sl 次 → 暂停 sl_filter_hours 小时（止盈不清零）
-  max_consecutive_sl: GUARD_DEFAULTS.max_consecutive_sl,
-  sl_filter_hours: GUARD_DEFAULTS.sl_filter_hours,
-  // 普通止损后该币冷却（分钟）
-  sl_cooldown_minutes: GUARD_DEFAULTS.sl_cooldown_minutes,
-  // 严重止损阈值（价格变动 %，不含杠杆）与冷却（小时）
-  severe_sl_pct: GUARD_DEFAULTS.severe_sl_pct,
-  severe_sl_cooldown_hours: GUARD_DEFAULTS.severe_sl_cooldown_hours,
   watchlist: [],
 };
 
@@ -300,6 +307,7 @@ const LIVE_DEFAULTS = {
 const EXEC_MODES = ['sim', 'okx_demo', 'okx_live'];
 const EXCHANGE_MODES = ['okx_demo', 'okx_live'];
 const LIVE_CONFIRM_TEXT = '确认实盘';
+const SHORT_CONFIRM_TEXT = '确认做空';
 
 function isExchangeMode(m) {
   return m === 'okx_demo' || m === 'okx_live';
@@ -318,35 +326,38 @@ function envTextOf(m) {
   return m === 'okx_live' ? '实盘' : '模拟盘';
 }
 
+/** 唯一启用的策略 */
+const ST = getStrategy(ACTIVE_STRATEGY_ID);
+function stParams(cfg) {
+  return ST.clamp(cfg);
+}
+
 function clampConfig(body = {}) {
   const base = normExecMode(body?.exec_mode) === 'okx_live' ? { ...DEFAULT_SCAN, ...LIVE_DEFAULTS } : DEFAULT_SCAN;
   const cfg = { ...base, ...body };
-  cfg.mode = cfg.mode === 'swap' ? 'swap' : 'spot';
+  cfg.mode = cfg.mode === 'spot' ? 'spot' : 'swap';
   cfg.profile = cfg.profile === 'live' ? 'live' : 'demo';
-  cfg.bar = cfg.bar || '15m';
-  cfg.rsi_period = Math.max(2, Number(cfg.rsi_period) || 6);
-  cfg.rsi_buy_threshold = Number(cfg.rsi_buy_threshold) || 20;
-  cfg.take_profit_pct = Number(cfg.take_profit_pct) || 8;
-  cfg.stop_loss_pct = Number(cfg.stop_loss_pct) || 6;
+  Object.assign(cfg, stParams(cfg)); // bar / atr_* / disaster_stop_pct / allow_short / flip_only / warmup_bars
+  cfg.disaster_cooldown_minutes = Math.max(0, Math.min(1440, Number.isFinite(Number(cfg.disaster_cooldown_minutes)) ? Number(cfg.disaster_cooldown_minutes) : 60));
+  cfg.signal_max_age_sec = Math.max(30, Math.min(3600, Number(cfg.signal_max_age_sec) || 300));
+  cfg.sim_fee_pct = Math.max(0, Math.min(1, Number.isFinite(Number(cfg.sim_fee_pct)) ? Number(cfg.sim_fee_pct) : 0.05));
+  cfg.sim_slippage_pct = Math.max(0, Math.min(2, Number.isFinite(Number(cfg.sim_slippage_pct)) ? Number(cfg.sim_slippage_pct) : 0.031));
   cfg.max_positions = Math.max(1, Math.min(20, Number(cfg.max_positions) || 5));
   cfg.amount = Math.max(1, Number(cfg.amount) || 100);
   cfg.leverage = Math.max(1, Math.min(20, Math.round(Number(cfg.leverage) || 1)));
   cfg.tdMode = 'cross'; // 全仓（固定）
-  cfg.posSide = 'long'; // 多头（固定）
   cfg.order_ccy = 'USDT'; // 下单单位 USDT（固定）
+  delete cfg.posSide; // 方向由每个信号决定（持仓上记录 direction），不再有全局固定方向
   cfg.minVolUsd24h = Math.max(0, Number(cfg.minVolUsd24h) || 300_000);
   cfg.universeLimit = Math.max(1, Math.min(200, Number(cfg.universeLimit) || 120));
   cfg.scanConcurrency = Math.max(1, Math.min(12, Number(cfg.scanConcurrency) || 6));
   // 信号评估间隔：WS 推送行情后，前端/后端评估节奏（可短）
   cfg.refreshSec = Math.max(2, Number(cfg.refreshSec) || Number(cfg.poll_interval_sec) || 60);
-  Object.assign(cfg, clampGuardCfg(cfg)); // max_consecutive_sl / sl_filter_hours / sl_cooldown_minutes / severe_sl_pct / severe_sl_cooldown_hours
   cfg.exec_mode = normExecMode(cfg.exec_mode);
   // profile 跟随执行方式：实盘=live，模拟盘=demo（本地模拟保留原值，永不下单）
   if (cfg.exec_mode === 'okx_live') cfg.profile = 'live';
   else if (cfg.exec_mode === 'okx_demo') cfg.profile = 'demo';
   if (cfg.exec_mode === 'okx_live') cfg.leverage = Math.min(cfg.leverage, LIVE_MAX_LEVERAGE);
-  cfg.confirm_on_close = cfg.confirm_on_close === true || cfg.confirm_on_close === 'true' || cfg.confirm_on_close === 1;
-  Object.assign(cfg, clampBbCfg(cfg)); // bb_filter_enabled / bb_period / bb_mult（旧配置缺字段 → 默认值）
   {
     const dl = Number(cfg.daily_loss_limit_usdt);
     cfg.daily_loss_limit_usdt = Number.isFinite(dl) && dl >= 0 ? Math.min(dl, 1e9) : 50;
@@ -355,11 +366,20 @@ function clampConfig(body = {}) {
     const sp = Number(cfg.max_spread_pct);
     cfg.max_spread_pct = Number.isFinite(sp) && sp > 0 ? Math.min(sp, 20) : 0.3;
   }
+  // 清掉旧 RSI / 布林带 / 止盈止损 / 冷却字段，避免旧前端配置残留在内存配置里
+  for (const k of [
+    'rsi_period', 'rsi_buy_threshold', 'confirm_on_close', 'bb_filter_enabled', 'bb_period', 'bb_mult',
+    'take_profit_pct', 'stop_loss_pct', 'max_consecutive_sl', 'sl_filter_hours', 'sl_cooldown_minutes', 'severe_sl_pct', 'severe_sl_cooldown_hours',
+  ]) delete cfg[k];
   cfg.watchlist = Array.isArray(cfg.watchlist)
     ? cfg.watchlist.map((x) => normalizeInstId(x, cfg.mode)).filter(Boolean)
     : (cfg.instId ? [normalizeInstId(cfg.instId, cfg.mode)] : []);
   return cfg;
 }
+
+/** 当前时间（毫秒）。测试可通过 __test.setNow 注入，保证翻转有效期 / 冷却 / 开仓时间可复现 */
+let nowFn = () => Date.now();
+const nowMs = () => nowFn();
 
 // ---------- Scan state ----------
 /** @type {Map<string, object>} */
@@ -367,7 +387,7 @@ const positions = new Map();
 /** 已开始但尚未完成本地入账的交易所开仓；key = `${exec_mode}:${instId}`。 */
 const pendingOrders = new Map();
 /** 同币冷却（普通止损 / 严重止损 / 窗口内多次止损），按执行模式分开，落盘 data/cooldowns.json */
-const coinGuard = new CoinGuard({ path: COOLDOWN_PATH, log: (level, msg) => pushLog(level, msg) });
+const coinGuard = new CoinGuard({ path: COOLDOWN_PATH, log: (level, msg) => pushLog(level, msg), now: () => nowMs() });
 /** @type {Array<object>} */
 let lastSignals = [];
 /** @type {Array<object>} */
@@ -378,7 +398,9 @@ let scanTimer = null;
 let scanBusy = false;
 let feedMode = 'websocket'; // 'websocket' | 'polling-legacy'
 
-const candleStore = new CandleStore({ maxBars: 200, period: 14 });
+const candleStore = new CandleStore({ maxBars: 300 });
+/** 已处理的翻转：`模式|币` -> 翻转 K 线开盘时间（同一次翻转只执行一次，重启后也不重复；落盘在 positions.json） */
+const handledFlips = new Map();
 const wsManager = new OkxWsManager({ log: pushLog, maxArgsPerConn: 50 });
 let evalDebounceTimer = null;
 
@@ -438,13 +460,13 @@ function orderTimesOf(mode) {
 
 function ordersLastHour(mode) {
   const m = normExecMode(mode);
-  const cut = Date.now() - 3600 * 1000;
+  const cut = nowMs() - 3600 * 1000;
   riskState.orderTimesByMode[m] = orderTimesOf(m).filter((t) => t > cut);
   return riskState.orderTimesByMode[m].length;
 }
 
 function recordOrderTime(mode) {
-  orderTimesOf(mode).push(Date.now());
+  orderTimesOf(mode).push(nowMs());
   ordersLastHour(mode);
   saveState();
 }
@@ -482,20 +504,29 @@ function saveState() {
   try {
     const all = [...positions.values()];
     const pending = [...pendingOrders.values()];
+    const handled = Object.fromEntries(handledFlips);
+    const hasShort = all.some((p) => p.direction === 'short') || pending.some((p) => p.direction === 'short');
     writeJsonAtomic(STATE_PATH, {
+      schema_version: SCHEMA_VERSION,
       updatedAt: new Date().toISOString(),
       positions: all.filter((p) => p.exec_mode !== 'okx_live'),
       killSwitch: riskState.killSwitch,
       orderTimesByMode: { sim: orderTimesOf('sim'), okx_demo: orderTimesOf('okx_demo') },
       pendingOrders: pending.filter((p) => p.exec_mode !== 'okx_live'),
+      // 已处理的翻转信号（key = 模式|币，value = 翻转K线开盘时间）：重启后不重复执行同一次翻转
+      handledFlips: Object.fromEntries(Object.entries(handled).filter(([k]) => !k.startsWith('okx_live|'))),
+      has_short: hasShort, // 回滚旧版本前必须确认没有空头持仓（旧版会把一切持仓当多头）
     });
     const live = all.filter((p) => p.exec_mode === 'okx_live');
     if (live.length || pending.some((p) => p.exec_mode === 'okx_live') || existsSync(LIVE_STATE_PATH) || orderTimesOf('okx_live').length) {
       writeJsonAtomic(LIVE_STATE_PATH, {
+        schema_version: SCHEMA_VERSION,
         updatedAt: new Date().toISOString(),
         positions: live,
         orderTimes: orderTimesOf('okx_live'),
         pendingOrders: pending.filter((p) => p.exec_mode === 'okx_live'),
+        handledFlips: Object.fromEntries(Object.entries(handled).filter(([k]) => k.startsWith('okx_live|'))),
+        has_short: live.some((p) => p.direction === 'short'),
       });
     }
     return true;
@@ -541,12 +572,34 @@ function updatePendingOrder(event) {
   }
 }
 
+/** 已处理翻转的键 */
+function flipKey(mode, instId) {
+  return `${normExecMode(mode)}|${instId}`;
+}
+
+/** 读文件并归一化：旧记录补 strategy_id=rsi_dip / direction=long；需要升级时先做一次性 *.bak-pre-v2 备份（原文件不动） */
+function readStateFile(path) {
+  const raw = JSON.parse(readFileSync(path, 'utf8'));
+  const positionsRaw = Array.isArray(raw?.positions) ? raw.positions : [];
+  const pendingRaw = Array.isArray(raw?.pendingOrders) ? raw.pendingOrders : [];
+  const upgrade = raw?.schema_version !== SCHEMA_VERSION || positionsRaw.some(needsUpgrade) || pendingRaw.some(needsUpgrade);
+  if (upgrade && backupOnce(path)) {
+    pushLog('info', `持仓文件已升级前备份：${path}.bak-pre-v2（旧持仓将补 strategy_id=rsi_dip / direction=long）`);
+  }
+  return {
+    raw,
+    positions: positionsRaw.filter((p) => p && p.instId).map((p) => withStrategyDefaults(p)),
+    pending: pendingRaw.filter((p) => p && p.instId).map((p) => withStrategyDefaults(p)),
+  };
+}
+
 function loadState() {
   try {
     let list = [];
     if (existsSync(STATE_PATH)) {
-      const raw = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
-      list = (Array.isArray(raw?.positions) ? raw.positions : []).filter((p) => p && p.instId && p.exec_mode !== 'okx_live');
+      const f = readStateFile(STATE_PATH);
+      const raw = f.raw;
+      list = f.positions.filter((p) => p.exec_mode !== 'okx_live');
       if (raw?.killSwitch && typeof raw.killSwitch === 'object') {
         riskState.killSwitch = { on: !!raw.killSwitch.on, at: raw.killSwitch.at || null, reason: raw.killSwitch.reason || null };
       }
@@ -561,21 +614,19 @@ function loadState() {
         riskState.orderTimesByMode.sim = [...legacy];
         riskState.orderTimesByMode.okx_demo = [...legacy];
       }
-      for (const p of Array.isArray(raw?.pendingOrders) ? raw.pendingOrders : []) {
-        if (p?.instId && isExchangeMode(p.exec_mode)) {
-          pendingOrders.set(pendingOrderKey(p.exec_mode, p.instId), p);
-        }
+      for (const p of f.pending) {
+        if (isExchangeMode(p.exec_mode)) pendingOrders.set(pendingOrderKey(p.exec_mode, p.instId), p);
       }
+      for (const [k, v] of Object.entries(raw?.handledFlips || {})) if (Number.isFinite(Number(v))) handledFlips.set(k, Number(v));
     }
     let liveList = [];
     if (existsSync(LIVE_STATE_PATH)) {
-      const rawLive = JSON.parse(readFileSync(LIVE_STATE_PATH, 'utf8'));
-      liveList = (Array.isArray(rawLive?.positions) ? rawLive.positions : []).filter((p) => p && p.instId);
+      const f = readStateFile(LIVE_STATE_PATH);
+      liveList = f.positions;
       for (const p of liveList) p.exec_mode = 'okx_live';
-      if (Array.isArray(rawLive?.orderTimes)) riskState.orderTimesByMode.okx_live = rawLive.orderTimes.filter((t) => Number.isFinite(t));
-      for (const p of Array.isArray(rawLive?.pendingOrders) ? rawLive.pendingOrders : []) {
-        if (p?.instId) pendingOrders.set(pendingOrderKey('okx_live', p.instId), { ...p, exec_mode: 'okx_live' });
-      }
+      if (Array.isArray(f.raw?.orderTimes)) riskState.orderTimesByMode.okx_live = f.raw.orderTimes.filter((t) => Number.isFinite(t));
+      for (const p of f.pending) pendingOrders.set(pendingOrderKey('okx_live', p.instId), { ...p, exec_mode: 'okx_live' });
+      for (const [k, v] of Object.entries(f.raw?.handledFlips || {})) if (Number.isFinite(Number(v))) handledFlips.set(k, Number(v));
     }
     for (const p of [...list, ...liveList]) {
       if (positions.has(p.instId)) {
@@ -590,6 +641,13 @@ function loadState() {
         'info',
         `已恢复持仓 ${list.length + liveList.length} 个（本地模拟 ${list.length - demo} · OKX 模拟盘 ${demo} · OKX 实盘 ${liveList.length}）`
       );
+      const legacy = [...positions.values()].filter((p) => !isManagedPosition(p));
+      if (legacy.length) {
+        pushLog(
+          'warn',
+          `其中 ${legacy.length} 个是旧策略持仓（${legacy.map((p) => `${p.instId}/${dirText(p.direction)}/${p.strategy_id}`).join('、')}）：新版只对账、靠交易所止盈止损单平仓，不做信号平仓 / 反手，也不为其开新仓`
+        );
+      }
     }
     if (riskState.killSwitch.on) pushLog('warn', '急停状态已恢复：当前禁止开新仓（可在界面「解除急停」）');
     if (pendingOrders.size) pushLog('warn', `已恢复 ${pendingOrders.size} 个待确认订单，将在对账时自动核实并接管`);
@@ -602,16 +660,22 @@ function loadState() {
 function loadCoinGuard() {
   try {
     if (existsSync(COOLDOWN_PATH)) {
-      const n = coinGuard.load(DEFAULT_SCAN);
+      try {
+        const v = JSON.parse(readFileSync(COOLDOWN_PATH, 'utf8'))?.version;
+        if (v !== 2 && backupOnce(COOLDOWN_PATH)) pushLog('info', `冷却文件已升级前备份：${COOLDOWN_PATH}.bak-pre-v2（旧条目归入 rsi_dip）`);
+      } catch {
+        /* 解析失败由 load 处理 */
+      }
+      const n = coinGuard.load(GUARD_DEFAULTS);
       if (n > 0) pushLog('info', `已恢复同币冷却 ${n} 个（重启不影响冷却计时）`);
     } else {
       const trades = [];
       for (const m of EXEC_MODES) trades.push(...listTrades(200, m));
-      const n = coinGuard.seedFromTrades(trades, DEFAULT_SCAN);
+      const n = coinGuard.seedFromTrades(trades, GUARD_DEFAULTS);
       pushLog('info', `首次启用同币冷却：已按账本近期止损补建 ${n} 个冷却`);
     }
-    for (const it of coinGuard.list(DEFAULT_SCAN)) {
-      pushLog('info', `[冷却] ${execModeText(it.exec_mode)} ${it.instId} ${it.kindText}，${it.remainingText}`);
+    for (const it of coinGuard.list(GUARD_DEFAULTS)) {
+      pushLog('info', `[冷却] ${execModeText(it.exec_mode)} ${it.instId}（${it.strategy_id}）${it.kindText}，${it.remainingText}`);
     }
   } catch (e) {
     pushLog('warn', `恢复同币冷却失败：${e.message}`);
@@ -630,6 +694,17 @@ function demoPositions() {
 function viewModeOf(req) {
   const q = req?.query?.exec_mode;
   return q ? normExecMode(q) : normExecMode(effectiveCfg().exec_mode);
+}
+
+/** 做空能力（前端据此提示）：env=服务端环境变量是否放行；各模式是否实际可做空还需策略 allow_short */
+function shortStatus() {
+  const f = shortEnvFlags();
+  return {
+    env_allow_short: f.base,
+    env_allow_short_live: f.live,
+    block_reason: { sim: shortEnvBlockReason('sim'), okx_demo: shortEnvBlockReason('okx_demo'), okx_live: shortEnvBlockReason('okx_live') },
+    confirmText: SHORT_CONFIRM_TEXT,
+  };
 }
 
 function execPublic(cfg = effectiveCfg(), viewMode) {
@@ -654,6 +729,7 @@ function execPublic(cfg = effectiveCfg(), viewMode) {
       defaults: LIVE_DEFAULTS,
       confirmText: LIVE_CONFIRM_TEXT,
     },
+    short: shortStatus(),
     liveTradingActive: liveTradingActive(),
     liveAutoTradeDisabled: !liveTradingActive(),
   };
@@ -1044,58 +1120,36 @@ async function fetchTickerHttp(instId) {
   return parseTicker(json.data);
 }
 
-async function fetchInstMetricsLocal(instId, cfg) {
-  const bar = cfg.bar || '1H';
-  const period = Number(cfg.rsi_period) || 14;
-  const need = Math.max(period + 2, 30);
-  const candles = await fetchCandles(instId, bar, Math.max(need, 100));
-  // 只用已收盘
-  const closed = candles
-    .filter((c) => String(c[8] ?? '1') === '1')
-    .map((c) => Number(c[4]))
-    .filter((n) => Number.isFinite(n))
-    .reverse(); // 旧→新
-  const rsi = calcRsi(closed, period);
-  let price = closed.length ? closed[closed.length - 1] : null;
-  let ticker = null;
-  try {
-    ticker = await fetchTickerHttp(instId);
-    if (ticker?.last != null && Number.isFinite(ticker.last)) price = ticker.last;
-  } catch {
-    try {
-      const tickerRaw = await runOkxJson(['market', 'ticker', instId], { timeoutMs: 30000 });
-      ticker = parseTicker(tickerRaw);
-      if (ticker?.last != null && Number.isFinite(ticker.last)) price = ticker.last;
-    } catch {
-      /* ignore */
-    }
-  }
-  return { instId, rsi, price, ticker };
-}
-
+// ---------- 冷却 ----------
 
 function listFilteredCoins(cfg) {
   return coinGuard.list(cfg || effectiveCfg());
 }
 
-/** 该币在指定执行模式下的冷却状态：null 或 { kind, until, remainingMs, reason, text } */
-function coinCooldown(instId, mode = effectiveCfg().exec_mode) {
-  return coinGuard.check(normExecMode(mode), instId);
-}
-
-function onTakeProfit(instId, mode) {
-  // 止盈不再清零窗口内止损次数
-  coinGuard.onTakeProfit(normExecMode(mode), instId);
+/** 该币在指定执行模式 / 策略下的冷却状态：null 或 { kind, until, remainingMs, reason, text } */
+function coinCooldown(instId, mode = effectiveCfg().exec_mode, strategyId = ACTIVE_STRATEGY_ID) {
+  return coinGuard.check(normExecMode(mode), instId, strategyId);
 }
 
 /**
- * 止损 / 强平后进入冷却
- * @param {object} pos 平仓的持仓
- * @param {object} cfg
- * @param {{ pct?: number, at?: number, action?: string }} info pct=价格变动%（不含杠杆）
+ * 平仓后冷却：
+ *  - SuperTrend 持仓：灾难止损 / 强平 → onDisasterStop（cfg.disaster_cooldown_minutes）；信号平仓（flip）、手动、急停不冷却；
+ *  - 旧 rsi_dip 持仓：沿用旧规则（onStopLoss，strategyId=rsi_dip），止盈不冷却。
  */
-function onStopLoss(pos, cfg, { pct = null, at = null, action = 'sl' } = {}) {
-  return coinGuard.onStopLoss(normExecMode(pos.exec_mode), pos.instId, cfg, { lossPct: pct, at, liq: action === 'liq' });
+function applyCloseCooldown(pos, action, pct, at = null) {
+  if (action !== 'sl' && action !== 'liq') return null;
+  const cfg = effectiveCfg();
+  const mode = normExecMode(pos.exec_mode);
+  if (isManagedPosition(pos)) {
+    return coinGuard.onDisasterStop(mode, pos.instId, {
+      strategyId: pos.strategy_id,
+      minutes: cfg.disaster_cooldown_minutes,
+      at,
+      lossPct: pct,
+      liq: action === 'liq',
+    });
+  }
+  return coinGuard.onStopLoss(mode, pos.instId, cfg, { lossPct: pct, at, liq: action === 'liq', strategyId: pos.strategy_id });
 }
 
 /** 服务端风控：返回拒绝原因（中文），null 表示放行。perInst=true 表示只针对该币（进入跳过冷却） */
@@ -1133,141 +1187,86 @@ function riskBlockReason(cfg, instId) {
   return null;
 }
 
-/**
- * 尝试开仓
- * @returns {{status:'opened'|'submitted'|'submitting'|'held'|'skip', reason?:string, pos?:object}}
- */
-function tryOpenPosition(signalRow, cfg) {
-  const instId = signalRow.instId;
-  const execMode = normExecMode(cfg.exec_mode);
+// ---------- 占用判定 / 翻转处理 ----------
+
+/** 该币的占用情况：kind='busy'（暂时忙：待确认订单 / 正在平仓，稍后重试）或 'occupied'（旧策略 / 外部 / 其他模式持仓，本策略不碰） */
+function occupiedInfo(instId, execMode) {
   const held = positions.get(instId);
   if (held) {
-    if ((held.exec_mode || 'sim') === execMode) return { status: 'held' };
-    return { status: 'skip', reason: `已有${execModeText(held.exec_mode)}持仓，不叠加开仓` };
-  }
-  if (pendingOpens.has(instId)) return { status: 'submitting' };
-  if (pendingOrderFor(execMode, instId)) {
-    return { status: 'submitting', reason: '存在待交易所确认的订单，暂不重复下单' };
-  }
-  const cd = coinCooldown(instId, execMode);
-  if (cd) return { status: 'skip', reason: cd.text, until: cd.until, cooldown: true, coinCooldown: cd.kind };
-  const skip = activeSkip(instId);
-  if (skip) return { status: 'skip', reason: skip.reason, cooldown: true };
-  const count = modePositions(execMode).length;
-  if (count + pendingOpens.size >= cfg.max_positions) {
-    return { status: 'skip', reason: `持仓已满（${count}/${cfg.max_positions}）`, full: true };
-  }
-  if (signalRow.price == null || !Number.isFinite(signalRow.price)) return { status: 'skip', reason: '暂无有效价格' };
-  if (execMode === 'okx_demo' && !demoHasInst(instId)) {
-    return { status: 'skip', reason: '模拟盘无此合约' };
-  }
-  const block = riskBlockReason(cfg, instId);
-  if (block) {
-    logThrottled(`risk:${block.key}`, 'warn', `[风控] ${block.msg}`, block.ms);
-    if (block.perInst) setSkip(instId, block.msg, block.kind || 'default', execMode);
-    return { status: 'skip', reason: block.msg };
-  }
-  if (isExchangeMode(execMode)) {
-    if (cfg.mode !== 'swap') return { status: 'skip', reason: `${execModeText(execMode)}仅支持永续` };
-    // 安全：实盘只有在 okx_live 扫描运行中且启动检查通过时才会下单
-    if (execMode === 'okx_live' && !liveTradingActive()) return { status: 'skip', reason: '实盘未激活（启动检查未通过或扫描未运行）' };
-    startExchangeOpen(signalRow, cfg);
-    return { status: 'submitted' };
-  }
-  // 本地模拟：永不下真实订单
-  const pos = openSimPosition(signalRow, cfg);
-  return pos ? { status: 'opened', pos } : { status: 'skip', reason: '本地模拟开仓失败' };
-}
-
-/** 跳过原因 → 冷却类别 */
-function skipKindOf(r) {
-  if (r?.skipKind === 'spread' || r?.skipKind === 'no_quote' || r?.skipKind === 'recheck') return r.skipKind;
-  return 'default';
-}
-
-/** OKX 模拟盘 / 实盘异步开仓（不阻塞信号评估） */
-async function startExchangeOpen(signalRow, cfg) {
-  const instId = signalRow.instId;
-  const execMode = cfg.exec_mode;
-  const ex = execFor(execMode);
-  const tag = ex.tag;
-  pendingOpens.add(instId);
-  try {
-    const r = await ex.openLong({
-      instId,
-      amount: cfg.amount,
-      leverage: cfg.leverage || 1,
-      tpPct: cfg.take_profit_pct,
-      slPct: cfg.stop_loss_pct,
-      rsi: signalRow.rsi,
-      rsiClosed: signalRow.rsiClosed ?? null,
-      maxSpreadPct: cfg.max_spread_pct,
-      profile: cfg.profile,
-      onSubmit: () => recordOrderTime(execMode),
-      onPending: updatePendingOrder,
-      recheck: () => recheckBuyCondition(instId, execMode),
-    });
-    if (r.ok) {
-      positions.set(instId, r.pos);
-      // 先持久化已接管持仓，再清 pending；任一步崩溃都能在重启后继续恢复。
-      if (saveState()) updatePendingOrder({ action: 'clear', exec_mode: execMode, instId });
-      else throw new Error('成交后持仓落盘失败，pending 记录已保留等待对账');
-      lastSkip.delete(instId);
-      // 只有真正成交入账才计为「新开」
-      pushLog('info', `${tag} 新开成交入账 1 | ${instId} | 持仓 ${modePositions(execMode).length}`);
-      setTimeout(() => reconcileExchange(execMode).catch(() => {}), 3000);
-    } else if (r.uncertain) {
-      logThrottled(
-        `pending:${execMode}:${instId}`,
-        'warn',
-        `${tag} ${instId} 订单结果尚未明确，已保留 pending 记录并暂停该币重复下单：${r.reason}`,
-        60 * 1000
-      );
-    } else if (r.skipped) {
-      if (r.skipKind === 'lock') return; // 并发保护，不冷却
-      const kind = skipKindOf(r);
-      const ms = setSkip(instId, r.reason, kind, execMode);
-      logThrottled(`skip:${instId}:${r.reason}`, 'info', `${tag} 未开仓：${r.reason}（${Math.round(ms / 60000) || 1} 分钟内不再重试该币）`, ms);
-    } else {
-      const ms = setSkip(instId, r.reason, 'error', execMode);
-      logThrottled(`skip:${instId}:${r.reason}`, 'warn', `${tag} 未开仓：${r.reason}（${Math.round(ms / 60000)} 分钟内不再重试该币）`, ms);
+    if ((held.exec_mode || 'sim') !== execMode) return { kind: 'occupied', reason: `已有${execModeText(held.exec_mode)}持仓，不叠加开仓` };
+    if (!isManagedPosition(held)) {
+      return { kind: 'occupied', reason: `该币已有旧策略持仓（${held.strategy_id} / ${dirText(held.direction)}头），SuperTrend 不接管、不叠加` };
     }
-  } catch (e) {
-    if (pendingOrderFor(execMode, instId)) {
-      pushLog('error', `${tag} ${instId} 开仓结果不明确：${e.message}；pending 记录已保留，等待自动对账，期间不会重复下单`);
-    } else {
-      const ms = setSkip(instId, `开仓失败：${e.message}`, 'error', execMode);
-      pushLog('error', `${tag} ${instId} 开仓失败：${e.message}（${Math.round(ms / 60000)} 分钟内不再重试该币）`);
-    }
-  } finally {
-    pendingOpens.delete(instId);
+    if (held.status === 'closing') return { kind: 'busy', reason: '该币持仓正在平仓处理中' };
   }
+  if (pendingOpens.has(instId) || pendingOrderFor(execMode, instId)) return { kind: 'busy', reason: '该币有待交易所确认的订单' };
+  if (isExchangeMode(execMode) && (externalByMode[execMode] || []).some((p) => p.instId === instId)) {
+    return { kind: 'occupied', reason: `${instId} 在${envTextOf(execMode)}已有外部持仓，不叠加开仓` };
+  }
+  return null;
 }
 
-function openSimPosition(signalRow, cfg) {
-  const instId = signalRow.instId;
+function markHandled(execMode, instId, ts) {
+  handledFlips.set(flipKey(execMode, instId), Number(ts));
+  saveState();
+}
 
-  const entry = signalRow.price;
-  const amount = cfg.amount;
+function metaFromFlip(row, flip, cfg) {
+  return {
+    flip_bar_ts: flip.ts,
+    flip_close_at: flip.closeAt,
+    flip_close: flip.close ?? null,
+    signal_price: row.price ?? null,
+    trend: row.trend ?? null,
+    atr: row.atr ?? null,
+    st_up: row.st_up ?? null,
+    st_dn: row.st_dn ?? null,
+    params: { period: cfg.atr_period, mult: cfg.atr_multiplier, method: cfg.atr_method, bar: cfg.bar },
+  };
+}
+
+// ---------- 本地模拟成交（含滑点 / 手续费 / 做空 / 强平价估算） ----------
+
+/** 市价成交价：买入向上滑、卖出向下滑 */
+function simFillPrice(price, side, slippagePct) {
+  const s = (Number(slippagePct) || 0) / 100;
+  return side === 'buy' ? price * (1 + s) : price * (1 - s);
+}
+
+function openSimPosition({ instId, direction, price, cfg, meta = null, trendEntry = false }) {
+  assertShortAllowed(direction, 'sim'); // 第 3 层做空断言
+  const slip = cfg.sim_slippage_pct;
+  const entry = simFillPrice(price, openSide(direction), slip);
   const leverage = cfg.mode === 'swap' ? cfg.leverage || 1 : 1;
-  const tp = longTpPrice(entry, cfg.take_profit_pct);
-  const sl = longSlPrice(entry, cfg.stop_loss_pct);
+  const amount = cfg.amount;
+  const notional = amount * leverage;
+  const sl = cfg.disaster_stop_pct > 0 ? stopLossPrice(entry, cfg.disaster_stop_pct, direction) : null;
+  const liq = cfg.mode === 'swap' && leverage > 1 ? estLiqPrice(entry, leverage, direction) : null;
+  const feeOpen = (notional * cfg.sim_fee_pct) / 100;
   const pos = {
     instId,
+    direction,
+    strategy_id: ACTIVE_STRATEGY_ID,
+    strategy_version: ST.version,
+    signal_meta: meta,
     entry_price: entry,
+    signal_price: price,
     amount,
     leverage,
+    notional_usdt: notional,
     tdMode: cfg.mode === 'swap' ? 'cross' : null,
-    posSide: cfg.mode === 'swap' ? 'long' : null,
+    posSide: cfg.mode === 'swap' ? 'net' : null,
     order_ccy: 'USDT',
-    take_profit_price: tp,
+    take_profit_price: null,
     stop_loss_price: sl,
-    // 开仓时的止盈止损百分比快照：之后改设置不会追溯影响已有持仓
-    take_profit_pct: cfg.take_profit_pct,
-    stop_loss_pct: cfg.stop_loss_pct,
-    rsi_at_entry: signalRow.rsi,
-    rsi_closed_at_entry: signalRow.rsiClosed ?? null,
+    sl_pct: cfg.disaster_stop_pct > 0 ? cfg.disaster_stop_pct : null,
+    tp_pct: null,
+    liq_price: liq,
+    sim_fee_pct: cfg.sim_fee_pct,
+    sim_slippage_pct: slip,
+    fee_open_usdt: feeOpen,
     at: new Date().toISOString(),
+    opened_ts: nowMs(),
     simulated: true,
     exec_mode: 'sim',
     profile: cfg.profile,
@@ -1276,106 +1275,62 @@ function openSimPosition(signalRow, cfg) {
   };
   positions.set(instId, pos);
   recordOrderTime('sim');
-
-  const liveNote = ' | 本地模拟（未下真实订单）';
-  const levNote =
-    cfg.mode === 'swap'
-      ? ` | 永续多头 全仓 ${leverage}x | 名义约 ${(amount * leverage).toFixed(0)} USDT`
-      : '';
   pushLog(
     'buy',
-    `[模拟买入] ${instId} @ ${entry} | 金额 ${amount} USDT${levNote} | 实时RSI=${signalRow.rsi?.toFixed?.(2) ?? signalRow.rsi ?? '—'} 收盘RSI=${signalRow.rsiClosed?.toFixed?.(2) ?? '—'} | 止盈 ${tp.toFixed(6)} | 止损 ${sl.toFixed(6)}${liveNote}`
+    `[模拟${direction === 'long' ? '开多' : '开空'}] ${instId} @ ${entry}（信号价 ${price}，滑点 ${slip}%） | 保证金 ${amount} USDT × ${leverage}x | 名义 ${notional.toFixed(0)} USDT | 开仓手续费 ${feeOpen.toFixed(4)} | 灾难止损 ${sl != null ? sl.toPrecision(7) : '关闭'}${liq ? ` | 估算强平价 ${liq.toPrecision(7)}` : ''} | ${trendEntry ? '按当前趋势入场' : '翻转入场'} | 本地模拟（未下真实订单）`
   );
   return pos;
 }
 
-/** 持仓的止盈止损百分比：优先用开仓时的快照，老数据回落到当前配置 */
-function exitPctOf(pos, cfg) {
-  const tp = Number(pos.take_profit_pct);
-  const sl = Number(pos.stop_loss_pct);
-  return {
-    tp: Number.isFinite(tp) && tp > 0 ? tp : Number(cfg.take_profit_pct),
-    sl: Number.isFinite(sl) && sl > 0 ? sl : Number(cfg.stop_loss_pct),
-  };
+/**
+ * 本地模拟平仓。action: flip / sl / liq / tp(旧持仓) / manual / kill
+ * 成交价 = 现价 ± 滑点（强平按强平价）；盈亏 = 方向收益 − 开平仓手续费，强平最多亏光保证金。
+ */
+function closeSimPosition(pos, price, action, cfg = effectiveCfg()) {
+  const dir = pos.direction === 'short' ? 'short' : 'long';
+  const slip = pos.sim_slippage_pct ?? cfg.sim_slippage_pct;
+  const feePct = pos.sim_fee_pct ?? cfg.sim_fee_pct;
+  const exit = action === 'liq' && Number(pos.liq_price) > 0 ? Number(pos.liq_price) : simFillPrice(price, closeSide(dir), slip);
+  const notional = Number(pos.notional_usdt) || (Number(pos.amount) || 0) * Math.max(1, Number(pos.leverage) || 1);
+  const rt = simRoundTrip({ notional, entry: pos.entry_price, exit, dir, feePct });
+  let net = rt.net;
+  if (action === 'liq') net = -(Number(pos.amount) || 0); // 强平：保守按亏光全部保证金记账
+  const trade = recordClose(pos, exit, action, rt.pct, {
+    pnl_usdt: net,
+    fee_usdt: rt.fee,
+    gross_pnl_usdt: rt.gross,
+    fee_open_usdt: rt.feeOpen,
+    sim: true,
+    sim_slippage_pct: slip,
+  });
+  positions.delete(pos.instId);
+  saveState();
+  const text = action === 'flip' ? '信号平仓' : action === 'sl' ? '灾难止损' : action === 'liq' ? '强平' : action === 'tp' ? '止盈' : action === 'kill' ? '急停平仓' : '手动平仓';
+  pushLog(
+    action === 'tp' ? 'tp' : action === 'sl' || action === 'liq' ? 'sl' : 'sell',
+    `[模拟${text}] ${pos.instId} ${dirText(dir)}头 入场 ${pos.entry_price} → 成交 ${exit} | ${rt.pct >= 0 ? '+' : ''}${rt.pct.toFixed(2)}% | 净盈亏 ${net.toFixed(4)} USDT（毛 ${rt.gross.toFixed(4)} − 手续费 ${rt.fee.toFixed(4)}）`
+  );
+  applyCloseCooldown(pos, action, rt.pct);
+  return trade;
 }
 
-function checkExit(pos, price, cfg) {
-  if (price == null || !Number.isFinite(price)) return null;
-  // OKX 模拟盘/实盘持仓由交易所端 OCO 止盈止损负责平仓，本地绝不自行平仓
-  if (isExchangeMode(pos.exec_mode)) return null;
-  const { tp: tpPct, sl: slPct } = exitPctOf(pos, cfg);
-  const profitPct = posProfitPct(pos.entry_price, price);
-  if (profitPct >= tpPct) {
-    const trade = recordClose(pos, price, 'tp', profitPct);
-    pushLog(
-      'tp',
-      `[模拟止盈] ${pos.instId} 入场 ${pos.entry_price} → 现价 ${price} | 盈利 ${profitPct.toFixed(2)}% | 约 ${trade.pnl_usdt.toFixed(2)} USDT`
-    );
-    positions.delete(pos.instId);
-    saveState();
-    onTakeProfit(pos.instId, pos.exec_mode);
-    return { action: 'tp', profitPct, pnl_usdt: trade.pnl_usdt };
-  }
-  if (profitPct <= -slPct) {
-    const trade = recordClose(pos, price, 'sl', profitPct);
-    pushLog(
-      'sl',
-      `[模拟止损] ${pos.instId} 入场 ${pos.entry_price} → 现价 ${price} | 亏损 ${profitPct.toFixed(2)}% | 约 ${trade.pnl_usdt.toFixed(2)} USDT`
-    );
-    positions.delete(pos.instId);
-    saveState();
-    onStopLoss(pos, cfg, { pct: profitPct, action: 'sl' });
-    return { action: 'sl', profitPct, pnl_usdt: trade.pnl_usdt };
-  }
-  return null;
+/** 模拟持仓的灾难止损 / 强平 / （旧持仓）止盈检查。返回触发的 action 或 null */
+function checkSimExit(pos, price) {
+  if (price == null || !Number.isFinite(price) || isExchangeMode(pos.exec_mode)) return null;
+  const dir = pos.direction === 'short' ? 'short' : 'long';
+  let action = null;
+  if (Number(pos.liq_price) > 0 && stopHit(price, Number(pos.liq_price), dir)) action = 'liq';
+  else if (Number(pos.stop_loss_price) > 0 && stopHit(price, Number(pos.stop_loss_price), dir)) action = 'sl';
+  else if (Number(pos.take_profit_price) > 0 && (dir === 'long' ? price >= pos.take_profit_price : price <= pos.take_profit_price)) action = 'tp';
+  if (!action) return null;
+  closeSimPosition(pos, price, action);
+  return action;
 }
 
-// ---------- 影子运行（RSI_ENGINE_SHADOW=1，默认关闭）：旧判断 vs 新策略，不一致只记日志 ----------
-const shadowStats = { rows: 0, rechecks: 0, mismatches: 0 };
-function shadowReport(kind, instId, detail) {
-  shadowStats.mismatches++;
-  logThrottled(`shadow:${kind}:${instId}`, 'warn', `[回归] 影子比对不一致（${kind}）${instId}：${detail}`, 10 * 60 * 1000);
-}
-const shadowSame = (a, b) => Object.is(a, b);
+// ---------- OKX 模拟盘 / 实盘：开仓与反手（异步，不阻塞信号评估） ----------
 
-/** 比对信号行；返回 1 表示做了一次比对（供计数） */
-function shadowCheckRow(instId, cfg, snap, price, notOnDemo, got) {
-  try {
-    const old = legacyEvaluateRow({ snap, price, closes: candleStore.closes(instId), notOnDemo }, cfg);
-    const bad = [];
-    for (const k of ['rsi', 'rsiClosed', 'signal', 'signalText', 'bbLower', 'bbBlocked', 'bbReason']) {
-      if (!shadowSame(old[k], got[k])) bad.push(`${k}: 旧=${JSON.stringify(old[k])} 新=${JSON.stringify(got[k])}`);
-    }
-    if ((old.bbKind ?? null) !== (got.blocked?.kind ?? null)) bad.push(`bbKind: 旧=${old.bbKind} 新=${got.blocked?.kind ?? null}`);
-    if (bad.length) shadowReport('信号行', instId, bad.join('；'));
-  } catch (e) {
-    shadowReport('信号行', instId, `影子比对自身异常：${e.message}`);
-  }
-  return 1;
-}
-
-function shadowCheckRecheck(instId, cfg, snap, got) {
-  try {
-    shadowStats.rechecks++;
-    const old = legacyRecheck({ snap, closes: candleStore.closes(instId) }, cfg);
-    const bad = [];
-    for (const k of ['ok', 'rsi', 'rsiClosed', 'reason']) {
-      if (!shadowSame(old[k], got[k])) bad.push(`${k}: 旧=${JSON.stringify(old[k])} 新=${JSON.stringify(got[k])}`);
-    }
-    if (bad.length) shadowReport('下单前复核', instId, bad.join('；'));
-  } catch (e) {
-    shadowReport('下单前复核', instId, `影子比对自身异常：${e.message}`);
-  }
-}
-
-/** 策略取参：由已夹紧的扫描配置派生 rsi_dip 的参数（扁平旧配置 → 策略参数，幂等） */
-const RSI_DIP = getStrategy('rsi_dip');
-function rsiDipParams(cfg) {
-  return RSI_DIP.clamp(cfg);
-}
-
-/** 下单前复核：读取最新 K 线快照，调用策略 evaluate(phase='recheck')（供交易所执行器在发单前调用） */
-function recheckBuyCondition(instId, execMode) {
+/** 下单前复核：仍在扫描、未急停、该次翻转仍是最新翻转（供执行器在发单前调用） */
+function recheckFlipEntry(instId, execMode, direction, flipTs, trendEntry = false) {
   if (!scanState?.running) return { ok: false, reason: '扫描已停止' };
   if (riskState.killSwitch.on) return { ok: false, reason: '急停已开启' };
   const cfg = scanState.config;
@@ -1383,21 +1338,188 @@ function recheckBuyCondition(instId, execMode) {
   if (execMode === 'okx_live' && !liveTradingActive()) return { ok: false, reason: '实盘未激活' };
   const snap = candleStore.snapshot(instId);
   if (!snap) return { ok: false, reason: '无行情快照' };
-  const params = rsiDipParams(cfg);
-  const ctx = ctxFromStore(candleStore, instId, params, { phase: 'recheck', price: snap.price, tradable: true });
-  const d = evaluateSafely(RSI_DIP, ctx, (e) => logThrottled(`strategy-err:rsi_dip:${instId}`, 'error', `策略 rsi_dip 复核异常（${instId}）：${e.message}`, 5 * 60 * 1000));
-  // 策略异常 = 视为无信号 = 复核不通过（保守，不下单）
-  const res = d ? recheckResultFromDecision(d) : { ok: false, reason: '策略评估异常，放弃下单' };
-  if (ENGINE_SHADOW) shadowCheckRecheck(instId, cfg, snap, res);
-  return res;
+  const want = direction === 'long' ? 1 : -1;
+  if (!snap.st.ready || snap.st.trend !== want) return { ok: false, reason: '趋势已变化' };
+  if (!trendEntry && !(snap.st.flip && snap.st.flip.ts === flipTs && snap.st.flip.dir === direction)) return { ok: false, reason: '翻转信号已被新信号取代' };
+  if (direction === 'short') {
+    const b = shortBlockReason({ direction, execMode, tradeMode: cfg.mode, cfgAllowShort: cfg.allow_short });
+    if (b) return { ok: false, reason: b };
+  }
+  return { ok: true };
 }
 
-/** 基于 candleStore 评估信号 / 止盈止损（不拉 CLI） */
+/** OKX 模拟盘 / 实盘开仓一腿（调用方负责 pendingOpens 占位） */
+async function startExchangeOpen({ instId, direction, flip, meta, trendEntry = false }, cfg) {
+  const execMode = cfg.exec_mode;
+  const ex = execFor(execMode);
+  const tag = ex.tag;
+  try {
+    const r = await ex.openPosition({
+      instId,
+      direction,
+      amount: cfg.amount,
+      leverage: cfg.leverage || 1,
+      tpPct: null,
+      slPct: cfg.disaster_stop_pct > 0 ? cfg.disaster_stop_pct : null,
+      strategyId: ACTIVE_STRATEGY_ID,
+      strategyVersion: ST.version,
+      signalMeta: meta,
+      maxSpreadPct: cfg.max_spread_pct,
+      profile: cfg.profile,
+      onSubmit: () => recordOrderTime(execMode),
+      onPending: updatePendingOrder,
+      recheck: () => recheckFlipEntry(instId, execMode, direction, flip?.ts, trendEntry),
+    });
+    if (r.ok) {
+      positions.set(instId, r.pos);
+      // 先持久化已接管持仓，再清 pending；任一步崩溃都能在重启后继续恢复。
+      if (saveState()) updatePendingOrder({ action: 'clear', exec_mode: execMode, instId });
+      else throw new Error('成交后持仓落盘失败，pending 记录已保留等待对账');
+      lastSkip.delete(instId);
+      pushLog('info', `${tag} 新开成交入账（${dirText(direction)}头）| ${instId} | 持仓 ${modePositions(execMode).length}`);
+      setTimeout(() => reconcileExchange(execMode).catch(() => {}), 3000);
+    } else if (r.uncertain) {
+      logThrottled(`pending:${execMode}:${instId}`, 'warn', `${tag} ${instId} 订单结果尚未明确，已保留 pending 记录并暂停该币重复下单：${r.reason}`, 60 * 1000);
+    } else if (r.skipped) {
+      if (r.skipKind === 'lock') return;
+      pushLog('info', `${tag} 未开仓（${dirText(direction)}头）：${r.reason}`);
+    } else {
+      pushLog('warn', `${tag} 未开仓（${dirText(direction)}头）：${r.reason}`);
+    }
+  } catch (e) {
+    if (pendingOrderFor(execMode, instId)) {
+      pushLog('error', `${tag} ${instId} 开仓结果不明确：${e.message}；pending 记录已保留，等待自动对账，期间不会重复下单`);
+    } else {
+      pushLog('error', `${tag} ${instId} 开仓失败：${e.message}`);
+    }
+  }
+}
+
+/** 反手的平仓腿落账：优先取交易所平仓记录（精确盈亏），多次查不到则按成交均价估算入账 */
+async function settleFlipClose(held, close, execMode) {
+  const ex = execFor(execMode);
+  let res = null;
+  for (let i = 0; i < 3 && !res; i++) {
+    if (positions.get(held.instId) !== held) return; // 对账已先入账
+    try {
+      res = await ex.resolveClose(held, usedCloseKeys(execMode));
+    } catch (e) {
+      logThrottled(`resolve-${held.instId}`, 'warn', `${ex.tag} 查询 ${held.instId} 平仓记录失败：${e.message}`, 60000);
+    }
+    if (!res && i < 2) await sleep(2000);
+  }
+  if (positions.get(held.instId) !== held) return;
+  if (res) finalizeExchangeClose(held, res);
+  else finalizeExchangeClose(held, { closeAvgPx: close.closeAvgPx, action: 'flip', inferred: false }, { estimated: true });
+}
+
+async function executeExchangeFlip({ instId, execMode, cfg, flip, plan, held, meta, trendEntry = false }) {
+  const ex = execFor(execMode);
+  pendingOpens.add(instId);
+  try {
+    if (plan.close && held) {
+      held.close_reason = 'flip';
+      let close;
+      try {
+        close = await ex.marketClose(held, 'flip');
+      } catch (e) {
+        held.close_reason = null;
+        pushLog('error', `${ex.tag} ${instId} 信号平仓失败：${e.message}（反手已中止，持仓保持，保护单仍在）`);
+        return;
+      }
+      if (!close.complete) {
+        pushLog('warn', `${ex.tag} ${instId} 信号平仓尚未完成，反手已中止：对账会自动重试平仓，平仓后不会自动开新仓，等待下一次翻转`);
+        return;
+      }
+      if (held.algoId) await ex.cancelProtection(held);
+      await settleFlipClose(held, close, execMode);
+      saveState();
+    }
+    if (plan.open) await startExchangeOpen({ instId, direction: plan.open, flip, meta, trendEntry }, cfg);
+  } catch (e) {
+    pushLog('error', `${ex.tag} ${instId} 反手流程异常：${e.message}`);
+  } finally {
+    pendingOpens.delete(instId);
+  }
+}
+
+/**
+ * 处理一次翻转（或「趋势入场」）。返回 { status:'deferred'|'handled', closed, opened, skip, text }
+ * deferred = 暂不处理（该币忙 / 无价格），下一轮评估重试；handled = 已消费（记入 handledFlips，不再重复）
+ */
+function handleFlip(row, flip, cfg, execMode, { trendEntry = false } = {}) {
+  const instId = row.instId;
+  const dir = flip.dir;
+  const occ = occupiedInfo(instId, execMode);
+  if (occ?.kind === 'busy') return { status: 'deferred', text: `待处理：${occ.reason}` };
+  if (!isExchangeMode(execMode) && !(row.price > 0)) return { status: 'deferred', text: '待处理：暂无有效价格' };
+
+  const held = positions.get(instId);
+  const heldDir = held && isManagedPosition(held) && (held.exec_mode || 'sim') === execMode ? held.direction : null;
+  const ageMs = trendEntry ? 0 : nowMs() - flip.closeAt;
+  const stale = ageMs > cfg.signal_max_age_sec * 1000;
+  const shortBlock = shortBlockReason({ direction: dir, execMode, tradeMode: cfg.mode, cfgAllowShort: cfg.allow_short });
+  const cd = coinCooldown(instId, execMode);
+  const full = modePositions(execMode).length + pendingOpens.size >= cfg.max_positions;
+  let plan = planFlip({ heldDir, occupied: occ?.reason || null, flipDir: dir, shortBlock, cooldown: cd?.text || null, full });
+  let skip = plan.skip;
+  if (stale && plan.open) {
+    plan = { ...plan, open: null, reverse: false };
+    skip = `信号已过期（${Math.round(ageMs / 1000)} 秒 > ${cfg.signal_max_age_sec} 秒），${plan.close ? '只平仓不反手' : '不入场'}`;
+  }
+  if (plan.open) {
+    let block = null;
+    const rb = riskBlockReason(cfg, instId);
+    if (rb) {
+      logThrottled(`risk:${rb.key}`, 'warn', `[风控] ${rb.msg}`, rb.ms);
+      block = rb.msg;
+    } else if (isExchangeMode(execMode) && cfg.mode !== 'swap') block = `${execModeText(execMode)}仅支持永续`;
+    else if (execMode === 'okx_demo' && !demoHasInst(instId)) block = '模拟盘无此合约';
+    else if (execMode === 'okx_live' && !liveTradingActive()) block = '实盘未激活（启动检查未通过或扫描未运行）';
+    if (block) {
+      plan = { ...plan, open: null, reverse: false };
+      skip = plan.close ? `仅平仓不反手：${block}` : block;
+    }
+  }
+
+  markHandled(execMode, instId, trendEntry ? flip.ts : flip.ts);
+  const word = dir === 'long' ? '买入翻转（转上升）' : '卖出翻转（转下降）';
+  const head = trendEntry ? `[趋势入场] ${instId} 当前${dir === 'long' ? '上升' : '下降'}趋势` : `[信号] ${instId} ${word}（K线收盘 ${new Date(flip.closeAt).toLocaleString('zh-CN', { hour12: false })}）`;
+  const plantext = plan.close || plan.open ? `${plan.close ? `平${dirText(heldDir)}` : ''}${plan.close && plan.open ? ' → ' : ''}${plan.open ? `开${dirText(plan.open)}` : ''}${plan.reverse ? '（反手）' : ''}` : '无操作';
+  pushLog(plan.close || plan.open ? 'info' : 'warn', `${head} | 计划：${plantext}${skip ? ` | ${skip}` : ''}`);
+
+  if (!plan.close && !plan.open) return { status: 'handled', closed: false, opened: false, skip, text: skip || '无操作' };
+
+  const meta = metaFromFlip(row, flip, cfg);
+  if (isExchangeMode(execMode)) {
+    executeExchangeFlip({ instId, execMode, cfg, flip, plan, held, meta, trendEntry }).catch((e) => pushLog('error', `反手流程异常 ${instId}：${e.message}`));
+    return { status: 'handled', closed: !!plan.close, opened: false, submitted: true, skip, text: '正在提交订单…' };
+  }
+  let closed = false;
+  let opened = false;
+  if (plan.close && held) {
+    closeSimPosition(held, row.price, 'flip', cfg);
+    closed = true;
+  }
+  if (plan.open) {
+    try {
+      openSimPosition({ instId, direction: plan.open, price: row.price, cfg, meta, trendEntry });
+      opened = true;
+    } catch (e) {
+      skip = `开仓被拒绝：${e.message}`;
+      pushLog('warn', `[模拟] ${instId} ${skip}`);
+    }
+  }
+  return { status: 'handled', closed, opened, skip, text: skip || '已执行' };
+}
+
+// ---------- 信号评估主循环 ----------
+
 function evaluateSignals({ quiet = false } = {}) {
   if (!scanState?.running) return;
   const cfg = scanState.config;
   const execMode = normExecMode(cfg.exec_mode);
-  const dipParams = rsiDipParams(cfg);
+  const params = stParams(cfg);
   const now = new Date().toISOString();
   const volMap = new Map(lastUniverse.map((u) => [u.instId, u]));
   const ids = [...new Set([...lastUniverse.map((u) => u.instId), ...positions.keys()])];
@@ -1405,45 +1527,39 @@ function evaluateSignals({ quiet = false } = {}) {
 
   for (const instId of ids) {
     const snap = candleStore.snapshot(instId);
+    if (!snap || snap.bars < 1) continue;
     const uni = volMap.get(instId);
-    if (!snap || snap.bars < (cfg.rsi_period || 14) + 1) {
-      // 无足够 K 线：不算进 signals
-      continue;
-    }
     const cd = coinCooldown(instId, execMode);
-    const filtered = !!cd;
-    // okx_demo：模拟盘不存在的合约（自选/持仓里的）永不触发
     const notOnDemo = execMode === 'okx_demo' && cfg.mode === 'swap' && !demoHasInst(instId);
     const price = snap.price ?? uni?.price ?? null;
-    // 信号判定交给策略（RSI 阈值 / 收盘确认 / 布林带下轨过滤 / 状态文案），此处只做结果映射。
-    // 被布林带挡住时不进入开仓环节 → 不写跳过冷却、不影响同币冷却计数
-    const ctx = ctxFromStore(candleStore, instId, dipParams, { phase: 'scan', price, tradable: !notOnDemo });
-    const decision = evaluateSafely(RSI_DIP, ctx, (e) => logThrottled(`strategy-err:rsi_dip:${instId}`, 'error', `策略 rsi_dip 评估异常（${instId}）：${e.message}`, 5 * 60 * 1000));
-    // 策略异常：该币本轮视为无信号
-    const dec = decision || { direction: null, signal: false, text: '策略评估异常', blocked: null, metrics: { rsi: null, rsiClosed: null, bbLower: null, bbBlocked: false, bbReason: null } };
-    const { rsi: rsiShow, rsiClosed, signal, bbLower, bbBlocked, bbReason } = rowFieldsFromDecision(dec);
-    let signalText = dec.text;
-    if (dec.blocked && !quiet) {
-      logThrottled(`bb:${instId}:${dec.blocked.kind}`, 'info', `${instId} RSI 已触发，${dec.blocked.reason}，不买入`, 30 * 60 * 1000);
-    }
-    if (ENGINE_SHADOW && decision) shadowStats.rows += shadowCheckRow(instId, cfg, snap, price, notOnDemo, { signal, signalText, rsi: rsiShow, rsiClosed, bbLower, bbBlocked, bbReason, blocked: dec.blocked });
-    // 冷却中的币仍标记为触发，由开仓环节跳过并显示「冷却中：…，剩余xx分钟」
-    if (cd && !signal) signalText = `${signalText}（${cd.text}）`;
+    const ctx = ctxFromStore(candleStore, instId, params, { phase: 'scan', price, tradable: !notOnDemo });
+    const decision = evaluateSafely(ST, ctx, (e) => logThrottled(`strategy-err:supertrend:${instId}`, 'error', `策略 supertrend 评估异常（${instId}）：${e.message}`, 5 * 60 * 1000));
+    const dec = decision || { direction: null, signal: false, text: '策略评估异常', metrics: {} };
+    const m = dec.metrics || {};
+    const held = positions.get(instId);
     rows.push({
       instId,
+      strategy_id: ACTIVE_STRATEGY_ID,
       volUsd24h: uni?.volUsd24h ?? 0,
       price,
-      rsi: rsiShow,
-      rsiClosed,
+      trend: m.trend ?? null, // 1 上升 / -1 下降
+      st_up: m.up ?? null,
+      st_dn: m.dn ?? null,
+      atr: m.atr ?? null,
+      readyBars: m.readyBars ?? 0,
+      flipDir: m.flipDir ?? null,
+      flipTs: m.flipTs ?? null,
+      flipAt: m.flipCloseAt ? new Date(m.flipCloseAt).toISOString() : null,
+      direction: dec.direction ?? null,
+      held: held && (held.exec_mode || 'sim') === execMode ? { direction: held.direction, strategy_id: held.strategy_id } : null,
       forming: !!snap.forming,
-      filtered,
+      stale: !!snap.stale,
+      filtered: !!cd,
       cooldown: cd ? { kind: cd.kind, until: new Date(cd.until).toISOString(), text: cd.text, reason: cd.reason } : null,
       notOnDemo,
-      signal,
-      signalText,
-      bbLower,
-      bbBlocked,
-      bbReason,
+      signal: !!dec.signal,
+      signalText: dec.text,
+      enterByTrend: !!m.enterByTrend,
       skipped: false,
       skipReason: null,
       skipUntil: null,
@@ -1452,64 +1568,96 @@ function evaluateSignals({ quiet = false } = {}) {
       error: null,
       at: snap.updatedAt || now,
       watchlist: !!uni?.watchlist,
+      _dec: dec,
+      _snap: snap,
     });
+  }
+
+  // 1) 持仓更新 + 本地模拟灾难止损 / 强平（先于翻转处理：同一轮里先看止损）
+  for (const pos of [...positions.values()]) {
+    const px = candleStore.get(pos.instId)?.price ?? null;
+    if (isExchangeMode(pos.exec_mode)) {
+      if (px != null) pos.ws_price = px;
+      continue;
+    }
+    if (px != null) {
+      pos.last_price = px;
+      pos.profit_pct = posProfitPct(pos.entry_price, px, pos.direction === 'short' ? 'short' : 'long');
+      checkSimExit(pos, px);
+    }
+  }
+
+  // 2) 翻转信号 → 平仓 / 反手 / 开仓（按 flip.ts 去重；信号过期只平不开）
+  let opened = 0;
+  let closed = 0;
+  let submitted = 0;
+  let signalCount = 0;
+  for (const r of rows) {
+    const dec = r._dec;
+    const snap = r._snap;
+    const flip = snap.st.flip;
+    delete r._dec;
+    delete r._snap;
+    if (dec.signal && flip && Number.isFinite(flip.ts)) {
+      const done = handledFlips.get(flipKey(execMode, r.instId));
+      if (done != null && done >= flip.ts) {
+        r.signal = false;
+        r.signalText = `最近翻转（${flip.dir === 'long' ? '买入' : '卖出'}）已处理`;
+        continue;
+      }
+      signalCount++;
+      const res = handleFlip(r, flip, cfg, execMode);
+      if (res.status === 'handled') {
+        if (res.closed) closed++;
+        if (res.opened) opened++;
+        if (res.submitted) {
+          submitted++;
+          r.submitting = true;
+        }
+        if (res.skip) {
+          r.skipped = true;
+          r.skipReason = res.skip;
+        }
+        r.signalText = res.submitting ? '触发，正在提交订单…' : res.skip ? `触发：${res.skip}` : r.signalText;
+        if (res.submitted) r.signalText = '触发，正在提交订单…';
+      } else {
+        r.skipped = true;
+        r.skipReason = res.text;
+        r.signalText = `触发：${res.text}`;
+      }
+    } else if (r.enterByTrend && !cfg.flip_only && dec.direction && snap.st.trendSince != null) {
+      // flip_only=false：无本策略持仓时按当前趋势入场（每段趋势只尝试一次，灾难止损后不会立刻重进）
+      const done = handledFlips.get(flipKey(execMode, r.instId));
+      if (done != null && done >= snap.st.trendSince) continue;
+      const occ = occupiedInfo(r.instId, execMode);
+      const held = positions.get(r.instId);
+      if (held && isManagedPosition(held)) continue;
+      if (occ?.kind === 'busy') continue;
+      signalCount++;
+      const res = handleFlip(r, { dir: dec.direction, ts: snap.st.trendSince, closeAt: nowMs(), close: r.price }, cfg, execMode, { trendEntry: true });
+      if (res.status === 'handled') {
+        if (res.opened) opened++;
+        if (res.submitted) {
+          submitted++;
+          r.submitting = true;
+        }
+        if (res.skip) {
+          r.skipped = true;
+          r.skipReason = res.skip;
+        }
+      }
+    }
   }
 
   rows.sort((a, b) => {
     if (a.signal !== b.signal) return a.signal ? -1 : 1;
-    const ar = a.rsi == null ? 999 : a.rsi;
-    const br = b.rsi == null ? 999 : b.rsi;
-    if (ar !== br) return ar - br;
+    if (!!a.held !== !!b.held) return a.held ? -1 : 1;
+    const at = a.flipAt ? Date.parse(a.flipAt) : 0;
+    const bt = b.flipAt ? Date.parse(b.flipAt) : 0;
+    if (at !== bt) return bt - at;
     return (b.volUsd24h || 0) - (a.volUsd24h || 0);
   });
-
-  lastSignals = rows.filter((r) => r.rsi != null && Number.isFinite(r.rsi) && r.rsi > 0);
-
-  // 止盈止损（仅本地模拟持仓；交易所持仓价格/盈亏由对账从交易所更新）
-  for (const pos of [...positions.values()]) {
-    const snap = candleStore.get(pos.instId);
-    const price = snap?.price ?? null;
-    if (isExchangeMode(pos.exec_mode)) {
-      if (price != null) pos.ws_price = price;
-      continue;
-    }
-    if (price != null) {
-      pos.last_price = price;
-      pos.profit_pct = posProfitPct(pos.entry_price, price);
-      pos.take_profit_price = longTpPrice(pos.entry_price, exitPctOf(pos, cfg).tp);
-      pos.stop_loss_price = longSlPrice(pos.entry_price, exitPctOf(pos, cfg).sl);
-      checkExit(pos, price, cfg);
-    }
-  }
-
-  // 开仓（逐个尝试，结果回写到信号行：跳过原因 / 提交中）
-  const signalRows = rows.filter((r) => r.signal && r.ok);
-  let opened = 0; // 真正成交入账（本地模拟立即入账）
-  let submitted = 0; // 交易所模式：已提交、等待成交
-  let fullLogged = false;
-  for (const s of signalRows) {
-    const res = tryOpenPosition(s, cfg);
-    if (res.status === 'opened') opened++;
-    else if (res.status === 'held') s.signalText = `${s.signalText}（已持仓）`;
-    else if (res.status === 'submitted') {
-      submitted++;
-      s.submitting = true;
-      s.signalText = '触发，正在提交订单…';
-    } else if (res.status === 'submitting') {
-      s.submitting = true;
-      s.signalText = '触发，正在提交订单…';
-    } else if (res.status === 'skip') {
-      s.skipped = true;
-      s.skipReason = res.reason || '未知原因';
-      const sk = activeSkip(s.instId);
-      s.skipUntil = res.until ? new Date(res.until).toISOString() : sk ? new Date(sk.until).toISOString() : null;
-      s.signalText = `触发但未下单：${s.skipReason}`;
-      if (res.full && !fullLogged && !quiet) {
-        fullLogged = true;
-        pushLog('info', `持仓已满 (${modePositions(execMode).length}/${cfg.max_positions})，仅监控止盈止损，不再新开`);
-      }
-    }
-  }
+  lastSignals = rows;
 
   scanState.lastScanAt = now;
   scanState.error = null;
@@ -1519,14 +1667,10 @@ function evaluateSignals({ quiet = false } = {}) {
     scanState.round = (scanState.round || 0) + 1;
     pushLog(
       'info',
-      `信号评估 #${scanState.round}：有效 ${lastSignals.length} | 信号 ${signalRows.length} | ${isExchangeMode(execMode) ? '提交开仓' : '新开'} ${
-        isExchangeMode(execMode) ? submitted : opened
-      } | 持仓 ${positions.size} | WS ${wsPublicStatus().connected ? '已连接' : '重连中'}`
+      `信号评估 #${scanState.round}：有效 ${rows.length} | 待处理信号 ${signalCount} | 平仓 ${closed} | ${isExchangeMode(execMode) ? '提交订单' : '新开'} ${isExchangeMode(execMode) ? submitted : opened} | 持仓 ${positions.size} | WS ${wsPublicStatus().connected ? '已连接' : '重连中'}`
     );
-  } else {
-    if (opened > 0) pushLog('info', `推送触发新开 ${opened} | 持仓 ${heldCount}`);
-    // 交易所模式：提交≠成交，成交入账后另有「新开成交入账」日志；提交日志节流
-    if (submitted > 0) logThrottled('push-submit', 'info', `推送触发提交 ${submitted} 笔（等待成交后入账）| 持仓 ${heldCount}`, 30 * 1000);
+  } else if (opened > 0 || closed > 0 || submitted > 0) {
+    pushLog('info', `推送触发：平仓 ${closed} | 新开 ${opened} | 提交订单 ${submitted} | 持仓 ${heldCount}`);
   }
 }
 
@@ -1543,18 +1687,21 @@ function scheduleEvaluate(reason = '') {
   }, 800);
 }
 
+function applyStParams(cfg) {
+  candleStore.setParams({ bar: cfg.bar, period: cfg.atr_period, mult: cfg.atr_multiplier, method: cfg.atr_method });
+}
+
 async function bootstrapCandles(cfg, universe) {
   candleStore.clear();
-  candleStore.setPeriod(cfg.rsi_period);
-  const need = Math.max(cfg.rsi_period + 2, CANDLE_BOOTSTRAP_LIMIT);
+  applyStParams(cfg);
   let ok = 0;
   let fail = 0;
-  pushLog('info', `开始 Bootstrap K 线：${universe.length} 个币 × ${cfg.bar} limit=${need}`);
+  pushLog('info', `开始 Bootstrap K 线：${universe.length} 个币 × ${cfg.bar} limit=${CANDLE_BOOTSTRAP_LIMIT}（历史翻转不算信号）`);
 
   await mapPool(universe, cfg.scanConcurrency, async (u) => {
     const instId = u.instId;
     try {
-      const candles = await fetchCandles(instId, cfg.bar, need);
+      const candles = await fetchCandles(instId, cfg.bar, CANDLE_BOOTSTRAP_LIMIT);
       if (!candles.length) {
         fail++;
         pushLog('warn', `无 K 线 ${instId}`);
@@ -1563,10 +1710,10 @@ async function bootstrapCandles(cfg, universe) {
       candleStore.bootstrap(instId, candles);
       if (u.price != null) candleStore.setPrice(instId, u.price);
       const snap = candleStore.snapshot(instId);
-      if (snap && snap.rsi != null && snap.rsi > 0) ok++;
+      if (snap?.st?.ready && snap.st.readyBars >= cfg.warmup_bars) ok++;
       else {
         fail++;
-        pushLog('warn', `K 线不足无法算 RSI ${instId} bars=${snap?.bars ?? 0}`);
+        pushLog('warn', `K 线不足无法预热 SuperTrend ${instId} bars=${snap?.bars ?? 0} 就绪=${snap?.st?.readyBars ?? 0}/${cfg.warmup_bars}`);
       }
     } catch (e) {
       fail++;
@@ -1574,8 +1721,40 @@ async function bootstrapCandles(cfg, universe) {
     }
   });
 
-  pushLog('info', `Bootstrap 完成：有效 RSI ${ok} | 失败/不足 ${fail}`);
+  pushLog('info', `Bootstrap 完成：指标有效 ${ok} | 失败/预热不足 ${fail}`);
   return { ok, fail };
+}
+
+let refillBusy = false;
+/** WS 漏 K 线 / 迟迟没有收盘推送的币：用 REST 补齐，补齐期间发生的翻转作为信号（仍受有效期约束） */
+async function refillStaleCandles() {
+  if (refillBusy || !scanState?.running) return;
+  refillBusy = true;
+  try {
+    const cfg = scanState.config;
+    const now = nowMs();
+    const need = [...candleStore.map.keys()].filter((id) => candleStore.needsRefill(id, now));
+    if (!need.length) return;
+    for (const id of need) candleStore.get(id).refillAt = now;
+    let n = 0;
+    await mapPool(need, cfg.scanConcurrency, async (instId) => {
+      try {
+        const oldLastTs = candleStore.get(instId)?.lastTs ?? Infinity;
+        const candles = await fetchCandles(instId, cfg.bar, CANDLE_BOOTSTRAP_LIMIT);
+        if (!candles.length) return;
+        candleStore.bootstrap(instId, candles, oldLastTs);
+        n++;
+      } catch (e) {
+        logThrottled(`refill:${instId}`, 'warn', `K 线补齐失败 ${instId}：${e.message}`, 5 * 60 * 1000);
+      }
+    });
+    if (n) {
+      pushLog('info', `K 线补齐：${n}/${need.length} 个币已用 REST 重建指标状态`);
+      scheduleEvaluate('refill');
+    }
+  } finally {
+    refillBusy = false;
+  }
 }
 
 function startWsFeed(cfg, instIds) {
@@ -1679,49 +1858,13 @@ function stopScanInternal() {
 
 let demoInstTimer = null;
 
-// ---------- Legacy single-coin helpers ----------
-let monitor = null;
-
-function getSignalState(cfg, rsi, price) {
-  const threshold = Number(cfg.rsi_buy_threshold);
-  const signal = rsi != null && Number.isFinite(rsi) && rsi > 0 && rsi < threshold;
-  const entry = monitor?.position?.entry_price ?? null;
-  const tpPct = Number(cfg.take_profit_pct);
-  const slPct = Number(cfg.stop_loss_pct);
-  let takeProfitPrice = null;
-  let stopLossPrice = null;
-  let profitPct = null;
-  if (entry != null && Number.isFinite(entry)) {
-    takeProfitPrice = longTpPrice(entry, tpPct);
-    stopLossPrice = longSlPrice(entry, slPct);
-    if (price != null) profitPct = posProfitPct(entry, price);
-  }
-  return {
-    rsi,
-    price,
-    rsi_buy_threshold: threshold,
-    signal,
-    signalText: signal ? 'RSI 进入超卖区，触发买入！' : '未触发买入信号',
-    entry_price: entry,
-    take_profit_price: takeProfitPrice,
-    stop_loss_price: stopLossPrice,
-    profit_pct: profitPct,
-    positions: positions.size || (monitor?.position ? 1 : 0),
-    max_positions: Number(cfg.max_positions) || 1,
-  };
-}
-
-async function fetchMarket(cfg) {
-  const instId = normalizeInstId(cfg.instId, cfg.mode);
-  return fetchInstMetricsLocal(instId, cfg);
-}
-
 // ---------- OKX 模拟盘对账（交易所为准） ----------
 
 function finalizeExchangeClose(pos, res, { estimated = false } = {}) {
-  const cfg = effectiveCfg();
+  if (positions.get(pos.instId) !== pos) return null; // 已被另一条路径（对账 / 反手）入账，防止重复记账
   const ex = execFor(pos.exec_mode);
   const rtag = `[${ex.envText}对账]`;
+  const dir = pos.direction === 'short' ? 'short' : 'long';
   // 账本以交易所为准：整仓累计平仓张数 / 开仓均价 → 同步张数、名义与实际保证金
   if (!estimated && res.closeTotalPos > 0) {
     if (Math.abs(res.closeTotalPos - Number(pos.contracts)) > 1e-9) {
@@ -1737,7 +1880,7 @@ function finalizeExchangeClose(pos, res, { estimated = false } = {}) {
   }
   const entry = Number(pos.entry_price);
   const exit = Number.isFinite(res.closeAvgPx) && res.closeAvgPx > 0 ? res.closeAvgPx : Number(pos.last_price) || entry;
-  const pct = entry > 0 ? posProfitPct(entry, exit) : 0;
+  const pct = entry > 0 ? posProfitPct(entry, exit, dir) : 0;
   const trade = recordClose(pos, exit, res.action, pct, {
     pnl_usdt: estimated ? null : res.realizedPnl,
     fee_usdt: estimated ? null : res.fee,
@@ -1753,34 +1896,49 @@ function finalizeExchangeClose(pos, res, { estimated = false } = {}) {
   const level = res.action === 'tp' ? 'tp' : res.action === 'sl' || res.action === 'liq' ? 'sl' : 'sell';
   pushLog(
     level,
-    `[${ex.envText}${reasonText(res.action)}] ${pos.instId} 入场 ${entry} → 平仓均价 ${fmtNum(exit, 8).replace(/\.?0+$/, '')} | ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% | 已实现 ${trade.pnl_usdt.toFixed(4)} USDT${
+    `[${ex.envText}${reasonText(res.action)}] ${pos.instId} ${dirText(dir)}头 入场 ${entry} → 平仓均价 ${fmtNum(exit, 8).replace(/\.?0+$/, '')} | ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}% | 已实现 ${trade.pnl_usdt.toFixed(4)} USDT${
       estimated ? '（估算：未查到平仓记录）' : `（含手续费 ${fmtNum(res.fee, 4)}${res.fundingFee ? ` · 资金费 ${fmtNum(res.fundingFee, 4)}` : ''}）`
     }${res.inferred ? ' · 类型按价格推断' : ''}`
   );
-  if (res.action === 'tp') onTakeProfit(pos.instId, pos.exec_mode);
-  else if (res.action === 'sl' || res.action === 'liq') onStopLoss(pos, cfg, { pct, at: res.uTime || null, action: res.action });
+  applyCloseCooldown(pos, res.action, pct, res.uTime || null);
   return trade;
+}
+
+/** 无平仓记录时的平仓类型推断：有止盈比例的旧持仓按价格推断 tp/sl；灾难止损价被触及 → sl；否则 external */
+function inferExchangeAction(pos, exit) {
+  const dir = pos.direction === 'short' ? 'short' : 'long';
+  if (pos.close_reason) return { action: pos.close_reason, inferred: false };
+  if (Number(pos.tp_pct) > 0) return { action: inferCloseAction(pos.entry_price, exit, dir), inferred: true };
+  if (Number(pos.stop_loss_price) > 0 && stopHit(exit, Number(pos.stop_loss_price), dir)) return { action: 'sl', inferred: true };
+  return { action: 'external', inferred: true };
 }
 
 function buildRecoveredPosition(pending, exchangePos, order, ex) {
   const saved = pending.pos ? { ...pending.pos } : {};
   const inst = ex.getInst(pending.instId);
+  const direction = (pending.direction || saved.direction) === 'short' ? 'short' : 'long';
   const contracts = Math.abs(Number(exchangePos?.pos) || Number(order?.accFillSz) || Number(saved.contracts) || 0);
   const entry = Number(exchangePos?.avgPx) || Number(order?.avgPx) || Number(saved.entry_price) || Number(pending.referencePrice) || 0;
   const leverage = Math.max(1, Number(pending.leverage) || Number(saved.leverage) || 1);
   const ctVal = Number(saved.ctVal) || Number(inst?.ctVal) || 0;
   const notional = contracts > 0 && ctVal > 0 && entry > 0 ? contracts * ctVal * entry : Number(saved.notional_usdt) || 0;
+  const tpPct = Number(pending.tpPct ?? saved.tp_pct) > 0 ? Number(pending.tpPct ?? saved.tp_pct) : null;
+  const slPct = Number(pending.slPct ?? saved.sl_pct) > 0 ? Number(pending.slPct ?? saved.sl_pct) : null;
   return {
     ...saved,
     instId: pending.instId,
     exec_mode: pending.exec_mode,
+    direction,
+    strategy_id: pending.strategy_id || saved.strategy_id || 'rsi_dip',
+    strategy_version: pending.strategy_version ?? saved.strategy_version ?? null,
+    signal_meta: pending.signal_meta ?? saved.signal_meta ?? null,
     simulated: false,
     external: false,
     entry_price: entry,
     amount: notional > 0 ? notional / leverage : Number(pending.amount) || Number(saved.amount) || 0,
     leverage,
     tdMode: 'cross',
-    posSide: exchangePos?.posSide || saved.posSide || 'net',
+    posSide: exchangePos?.raw?.posSide || saved.posSide || 'net',
     order_ccy: 'USDT',
     contracts,
     contractsStr: ex.fmtContracts(pending.instId, contracts),
@@ -1789,12 +1947,11 @@ function buildRecoveredPosition(pending, exchangePos, order, ex) {
     notional_usdt: notional,
     ordId: pending.ordId || saved.ordId || order?.ordId || null,
     clOrdId: pending.clOrdId || saved.clOrdId || order?.clOrdId || null,
-    tp_pct: Number(pending.tpPct) || Number(saved.tp_pct) || effectiveCfg().take_profit_pct,
-    sl_pct: Number(pending.slPct) || Number(saved.sl_pct) || effectiveCfg().stop_loss_pct,
-    take_profit_price: saved.take_profit_price || (entry > 0 ? longTpPrice(entry, Number(pending.tpPct || effectiveCfg().take_profit_pct)) : null),
-    stop_loss_price: saved.stop_loss_price || (entry > 0 ? longSlPrice(entry, Number(pending.slPct || effectiveCfg().stop_loss_pct)) : null),
-    rsi_at_entry: pending.rsi ?? saved.rsi_at_entry ?? null,
-    rsi_closed_at_entry: pending.rsiClosed ?? saved.rsi_closed_at_entry ?? null,
+    tp_pct: tpPct,
+    sl_pct: slPct,
+    take_profit_price: saved.take_profit_price || (entry > 0 && tpPct ? takeProfitPrice(entry, tpPct, direction) : null),
+    stop_loss_price: saved.stop_loss_price || (entry > 0 && slPct ? stopLossPrice(entry, slPct, direction) : null),
+    liq_price: exchangePos?.liqPx ?? saved.liq_price ?? null,
     at: saved.at || pending.createdAt || new Date().toISOString(),
     opened_ts: Number(saved.opened_ts) || new Date(pending.createdAt || Date.now()).getTime(),
     order_cts: Number(saved.order_cts) || Number(order?.cTime) || Number(order?.fillTime) || null,
@@ -1817,9 +1974,7 @@ async function recoverPendingOrders(mode, livePositions) {
       continue;
     }
 
-    const xp = (livePositions || []).find(
-      (p) => p.instId === pending.instId && Number(p.pos) !== 0 && (p.posSide === 'long' || (p.posSide === 'net' && Number(p.pos) > 0))
-    );
+    const xp = matchExchangePos(livePositions || [], pending.instId, pending.direction === 'short' ? 'short' : 'long');
     let order = null;
     if (!xp && (pending.ordId || pending.clOrdId)) {
       try {
@@ -1834,7 +1989,7 @@ async function recoverPendingOrders(mode, livePositions) {
       const pos = buildRecoveredPosition(pending, xp, order, ex);
       positions.set(pos.instId, pos);
       if (saveState()) updatePendingOrder({ action: 'clear', exec_mode: mode, instId: pending.instId });
-      pushLog('warn', `${ex.tag} 已从 pending 恢复并接管 ${pending.instId}：${pos.contractsStr} 张 @ ${pos.entry_price || '待对账'}`);
+      pushLog('warn', `${ex.tag} 已从 pending 恢复并接管 ${pending.instId}（${dirText(pos.direction)}头）：${pos.contractsStr} 张 @ ${pos.entry_price || '待对账'}`);
       continue;
     }
 
@@ -1888,13 +2043,23 @@ async function reconcileExchange(mode) {
     await recoverPendingOrders(mode, live);
 
     for (const pos of modePositions(mode)) {
-      const xp = live.find(
-        (p) => p.instId === pos.instId && (pos.posSide === 'long' ? p.posSide === 'long' : p.posSide === 'net' && Number(p.pos) > 0)
-      );
+      const cls = classifyPosition(live, pos);
+      if (cls.state === 'direction_mismatch') {
+        // 严重异常：交易所该币持仓方向与记录相反。不自动平仓、不重挂保护、不当作仓位消失，只报警等人工处理
+        logThrottled(
+          `dir-mismatch-${mode}-${pos.instId}`,
+          'error',
+          `${rtag} ${pos.instId} 持仓方向与程序记录不一致：记录=${dirText(pos.direction)}头，交易所=${dirText(cls.other.direction)}头 ${cls.other.pos} 张。已停止自动处理该币，请立即人工核对！`,
+          60 * 1000
+        );
+        continue;
+      }
+      const xp = cls.xp ? cls.xp.raw : null;
+      const dir = pos.direction === 'short' ? 'short' : 'long';
       const age = Date.now() - Number(pos.opened_ts || 0);
       if (xp) {
         const last = Number(xp.last) || Number(xp.markPx) || null;
-        const exPos = Number(xp.pos);
+        const exPos = Math.abs(Number(xp.pos));
         const exAvg = Number(xp.avgPx);
         // 交易所为准：张数 / 均价 / 名义 / 实际保证金
         if (exPos > 0 && (Math.abs(exPos - Number(pos.contracts)) > 1e-9 || (exAvg > 0 && Math.abs(exAvg - Number(pos.entry_price)) > 1e-12))) {
@@ -1917,7 +2082,7 @@ async function reconcileExchange(mode) {
         pos.upl = xp.upl !== '' && xp.upl != null ? Number(xp.upl) : null;
         pos.exchange_contracts = exPos;
         pos.liq_price = xp.liqPx ? Number(xp.liqPx) : null;
-        pos.profit_pct = last && pos.entry_price ? posProfitPct(pos.entry_price, last) : null;
+        pos.profit_pct = last && pos.entry_price ? posProfitPct(pos.entry_price, last, dir) : null;
         pos.missingSince = null;
         // 已触发的保护单若 60 秒后仓位仍在（部分平仓等），恢复为 open 以重新挂保护
         if (pos.status === 'closing' && !pos.close_reason && pos.closing_since && Date.now() - pos.closing_since > 60000) {
@@ -1948,9 +2113,9 @@ async function reconcileExchange(mode) {
               pushLog('error', `${rtag} ${pos.instId} 自动重试平仓失败：${e.message}（保留/恢复保护单后继续重试）`);
             }
           }
-          if (!closeComplete && !attached && pos.status === 'closing') {
+          if (!closeComplete && !attached && pos.status === 'closing' && ex.needsProtection(pos)) {
             try {
-              await ex.placeProtection(pos, pos.tp_pct ?? cfg.take_profit_pct, pos.sl_pct ?? cfg.stop_loss_pct);
+              await ex.placeProtection(pos, pos.tp_pct, pos.sl_pct);
               attached = true;
               pushLog('warn', `${rtag} ${pos.instId} 平仓尚未确认完成，已重新挂全仓止盈止损保护`);
             } catch (e) {
@@ -1987,7 +2152,7 @@ async function reconcileExchange(mode) {
               pos.tp_sl_attached = false;
               pos.tp_sl_full = false;
               try {
-                await ex.placeProtection(pos, pos.tp_pct ?? cfg.take_profit_pct, pos.sl_pct ?? cfg.stop_loss_pct);
+                await ex.placeProtection(pos, pos.tp_pct, pos.sl_pct);
               } catch (e) {
                 pushLog('error', `${ex.tag} ${pos.instId} 重挂全仓位止盈止损失败：${e.message} → 保护性市价平仓`);
                 pos.close_reason = 'failsafe';
@@ -1999,7 +2164,7 @@ async function reconcileExchange(mode) {
               }
             }
           }
-          if (!attached && (age > 15000 || pos.recovered_from_pending)) {
+          if (!attached && ex.needsProtection(pos) && (age > 15000 || pos.recovered_from_pending)) {
             // 保护单缺失：若已触发则等待交易所平仓；否则重新挂单，失败则保护性平仓
             let state = null;
             if (pos.algoId) {
@@ -2015,7 +2180,7 @@ async function reconcileExchange(mode) {
             } else {
               pushLog('warn', `${ex.tag} ${pos.instId} 交易所止盈止损委托缺失（状态 ${state || '无'}），尝试重新挂单`);
               try {
-                await ex.placeProtection(pos, pos.tp_pct ?? cfg.take_profit_pct, pos.sl_pct ?? cfg.stop_loss_pct);
+                await ex.placeProtection(pos, pos.tp_pct, pos.sl_pct);
                 pos.recovered_from_pending = false;
               } catch (e) {
                 pushLog('error', `${ex.tag} ${pos.instId} 重新挂止盈止损失败：${e.message} → 保护性市价平仓`);
@@ -2043,11 +2208,7 @@ async function reconcileExchange(mode) {
           finalizeExchangeClose(pos, res);
         } else if (Date.now() - pos.missingSince > 3 * 60 * 1000) {
           const exit = Number(pos.last_price) || Number(pos.entry_price);
-          finalizeExchangeClose(
-            pos,
-            { closeAvgPx: exit, action: pos.close_reason || inferCloseAction(pos.entry_price, exit), inferred: !pos.close_reason },
-            { estimated: true }
-          );
+          finalizeExchangeClose(pos, { closeAvgPx: exit, ...inferExchangeAction(pos, exit) }, { estimated: true });
         } else {
           continue;
         }
@@ -2062,6 +2223,7 @@ async function reconcileExchange(mode) {
       .map((p) => ({
         instId: p.instId,
         posSide: p.posSide,
+        direction: exchangeRowDirection(p),
         pos: Number(p.pos),
         avgPx: Number(p.avgPx) || null,
         lever: Number(p.lever) || null,
@@ -2103,6 +2265,10 @@ function validateStart(rawBody, cfg, { route = 'scan' } = {}) {
     }
     if (String(rawBody?.confirm_text ?? '') !== LIVE_CONFIRM_TEXT) {
       return { status: 400, error: `启动实盘必须在确认框中手动输入「${LIVE_CONFIRM_TEXT}」` };
+    }
+    // 实盘做空：策略开了 allow_short 且服务端环境变量放行时，另需单独确认文字
+    if (cfg.allow_short && !shortEnvBlockReason('okx_live') && String(rawBody?.short_confirm_text ?? '') !== SHORT_CONFIRM_TEXT) {
+      return { status: 400, error: `实盘开启做空必须额外输入「${SHORT_CONFIRM_TEXT}」（或关闭「允许做空」）` };
     }
     const rawLev = Number(rawBody?.leverage);
     if (Number.isFinite(rawLev) && rawLev > LIVE_MAX_LEVERAGE) {
@@ -2180,7 +2346,7 @@ app.get('/api/session', localAccess.sessionHandler);
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    service: 'rsi-bottom-hunter',
+    service: 'supertrend-trader',
     mode: 'market-scan',
     feed: feedMode,
     time: new Date().toISOString(),
@@ -2281,12 +2447,11 @@ app.post('/api/scan/start', async (req, res) => {
     const liveNote = isExchangeMode(cfg.exec_mode)
       ? ` | 执行：${execModeText(cfg.exec_mode)}真实下单 | 风控：日亏上限 ${cfg.daily_loss_limit_usdt}U · 每小时 ${cfg.max_orders_per_hour} 单 · 点差 ≤${cfg.max_spread_pct}%`
       : ' | 本地模拟（不下真实订单）';
+    const shortNote = shortBlockReason({ direction: 'short', execMode: cfg.exec_mode, tradeMode: cfg.mode, cfgAllowShort: cfg.allow_short });
     pushLog(
       'info',
-      `开始全市场扫描(WebSocket) mode=${cfg.mode} bar=${cfg.bar} 实时RSI<${cfg.rsi_buy_threshold}${cfg.confirm_on_close ? '（需收盘确认）' : ''}${
-        cfg.bb_filter_enabled ? ` 且价<布林下轨(${cfg.bb_period},${cfg.bb_mult})` : ''
-      } limit=${cfg.universeLimit} 评估间隔=${cfg.refreshSec}s${
-        cfg.mode === 'swap' ? ` 杠杆=${cfg.leverage}x 全仓多头 USDT` : ''
+      `开始 SuperTrend 全市场扫描(WebSocket) mode=${cfg.mode} bar=${cfg.bar} ATR(${cfg.atr_period}, ${cfg.atr_method.toUpperCase()}) × ${cfg.atr_multiplier} | 灾难止损 ${cfg.disaster_stop_pct > 0 ? `${cfg.disaster_stop_pct}%` : '关闭'} | ${cfg.flip_only ? '仅翻转入场' : '无仓位时按当前趋势入场'} | 做空：${shortNote ? `禁用（${shortNote}）` : '已开启'} | limit=${cfg.universeLimit} 评估间隔=${cfg.refreshSec}s${
+        cfg.mode === 'swap' ? ` 杠杆=${cfg.leverage}x 全仓 USDT` : ''
       }${liveNote}`
     );
 
@@ -2299,6 +2464,7 @@ app.post('/api/scan/start', async (req, res) => {
       } catch (e) {
         pushLog('error', `信号评估异常: ${e.message}`);
       }
+      refillStaleCandles().catch((e) => pushLog('warn', `K 线补齐异常: ${e.message}`));
     }, cfg.refreshSec * 1000);
     if (cfg.exec_mode === 'okx_demo') {
       // 定期刷新模拟盘合约列表（下架/新增）
@@ -2337,6 +2503,7 @@ app.get('/api/scan/status', (req, res) => {
     view_exec_mode: viewMode,
     externalPositions: isExchangeMode(viewMode) ? externalByMode[viewMode] : [],
     filtered: listFilteredCoins(scanState?.config || DEFAULT_SCAN),
+    short: shortStatus(),
     // 参数默认值（未启动扫描时 scan.config 为空，界面/校验可用这里的默认值）
     config_defaults: clampConfig({}),
     config_defaults_live: clampConfig({ exec_mode: 'okx_live' }),
@@ -2373,11 +2540,7 @@ app.get('/api/filtered', (_req, res) => {
   res.json({
     ok: true,
     count: list.length,
-    max_consecutive_sl: cfg.max_consecutive_sl,
-    sl_filter_hours: cfg.sl_filter_hours,
-    sl_cooldown_minutes: cfg.sl_cooldown_minutes ?? GUARD_DEFAULTS.sl_cooldown_minutes,
-    severe_sl_pct: cfg.severe_sl_pct ?? GUARD_DEFAULTS.severe_sl_pct,
-    severe_sl_cooldown_hours: cfg.severe_sl_cooldown_hours ?? GUARD_DEFAULTS.severe_sl_cooldown_hours,
+    disaster_cooldown_minutes: cfg.disaster_cooldown_minutes,
     items: list,
   });
 });
@@ -2385,12 +2548,14 @@ app.get('/api/filtered', (_req, res) => {
 app.post('/api/filtered/clear', (req, res) => {
   const instId = req.body?.instId ? String(req.body.instId).toUpperCase() : null;
   const mode = req.body?.exec_mode ? normExecMode(req.body.exec_mode) : null;
+  const strategyId = req.body?.strategy_id ? String(req.body.strategy_id) : null;
+  const tail = `${mode ? `（${execModeText(mode)}）` : ''}${strategyId ? `（策略 ${strategyId}）` : ''}`;
   if (instId) {
-    coinGuard.clear(instId, mode);
-    pushLog('info', `已手动解除冷却/过滤：${instId}${mode ? `（${execModeText(mode)}）` : ''}`);
+    coinGuard.clear(instId, mode, strategyId);
+    pushLog('info', `已手动解除冷却：${instId}${tail}`);
   } else {
-    coinGuard.clear(null, mode);
-    pushLog('info', `已清空全部同币冷却/止损过滤${mode ? `（${execModeText(mode)}）` : ''}`);
+    coinGuard.clear(null, mode, strategyId);
+    pushLog('info', `已清空全部同币冷却${tail}`);
   }
   res.json({ ok: true, items: listFilteredCoins(scanState?.config || DEFAULT_SCAN) });
 });
@@ -2398,17 +2563,17 @@ app.post('/api/filtered/clear', (req, res) => {
 app.get('/api/positions', (_req, res) => {
   const cfg = scanState?.config || DEFAULT_SCAN;
   const list = [...positions.values()].map((p) => {
+    const dir = p.direction === 'short' ? 'short' : 'long';
     const price = isExchangeMode(p.exec_mode) ? p.last_price ?? null : p.last_price ?? candleStore.get(p.instId)?.price ?? null;
-    const profitPct =
-      price != null
-        ? posProfitPct(p.entry_price, price)
-        : p.profit_pct ?? null;
+    const profitPct = price != null ? posProfitPct(p.entry_price, price, dir) : p.profit_pct ?? null;
     return {
       ...p,
+      direction: dir,
+      managed: isManagedPosition(p),
       last_price: price,
       profit_pct: profitPct,
-      take_profit_price: p.take_profit_price ?? longTpPrice(p.entry_price, exitPctOf(p, cfg).tp),
-      stop_loss_price: p.stop_loss_price ?? longSlPrice(p.entry_price, exitPctOf(p, cfg).sl),
+      take_profit_price: p.take_profit_price ?? null,
+      stop_loss_price: p.stop_loss_price ?? null,
     };
   });
   res.json({
@@ -2423,7 +2588,7 @@ app.get('/api/positions', (_req, res) => {
 app.get('/api/signals', (req, res) => {
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
   const onlySignal = String(req.query.signal || '') === '1';
-  let rows = lastSignals.filter((r) => r.rsi != null && Number.isFinite(r.rsi) && r.rsi > 0);
+  let rows = lastSignals;
   if (onlySignal) rows = rows.filter((r) => r.signal);
   res.json({
     ok: true,
@@ -2431,6 +2596,24 @@ app.get('/api/signals', (req, res) => {
     signals: rows.slice(0, limit),
     lastScanAt: scanState?.lastScanAt || null,
     feed: feedMode,
+  });
+});
+
+app.get('/api/strategies', (_req, res) => {
+  res.json({
+    ok: true,
+    active: ACTIVE_STRATEGY_ID,
+    strategies: [
+      {
+        id: ST.id,
+        name: ST.name,
+        version: ST.version,
+        directions: ST.directions,
+        params: ST.params,
+        defaults: SUPERTREND_DEFAULTS,
+      },
+    ],
+    short: shortStatus(),
   });
 });
 
@@ -2451,10 +2634,6 @@ app.post('/api/position/clear', (req, res) => {
     for (const [id, p] of [...positions.entries()]) {
       if (isExchangeMode(p.exec_mode)) kept++;
       else positions.delete(id);
-    }
-    if (monitor) {
-      monitor.position = null;
-      monitor.positionsCount = 0;
     }
     pushLog('info', `已清除全部本地模拟持仓${kept ? `（保留 OKX 模拟盘/实盘持仓 ${kept} 个，以交易所为准）` : ''}`);
   }
@@ -2490,43 +2669,16 @@ app.post('/api/position/close', async (req, res) => {
       return res.status(502).json({ error: e.message });
     }
   } else {
-    const price =
-      Number(candleStore.get(instId)?.price) || Number(pos.last_price) || Number(pos.entry_price);
-    const pct = posProfitPct(pos.entry_price, price);
-    const trade = recordClose(pos, price, 'manual', pct);
-    positions.delete(instId);
-    pushLog(
-      'sell',
-      `[手动平仓·本地模拟] ${instId} @ ${price} | ${pct.toFixed(2)}% | 约 ${trade.pnl_usdt.toFixed(2)} USDT`
-    );
+    const price = Number(candleStore.get(instId)?.price) || Number(pos.last_price) || Number(pos.entry_price);
+    closeSimPosition(pos, price, 'manual', effectiveCfg());
   }
   saveState();
   res.json({ ok: true, positions: [...positions.values()] });
 });
 
-app.post('/api/signal', async (req, res) => {
-  try {
-    const cfg = clampConfig(req.body || {});
-    if (!req.body?.instId) return res.status(400).json({ error: 'instId 必填（单币接口）' });
-    const { instId, rsi, price, ticker } = await fetchMarket({ ...cfg, instId: req.body.instId });
-    const state = getSignalState({ ...cfg, instId }, rsi, price);
-    pushLog('info', `手动刷新 ${instId} RSI=${rsi ?? 'N/A'} 价格=${price ?? 'N/A'} | ${state.signalText}`);
-    res.json({
-      ok: true,
-      profile: cfg.profile,
-      mode: cfg.mode,
-      instId,
-      bar: cfg.bar,
-      rsi_period: cfg.rsi_period,
-      feed: 'rest-local-rsi',
-      ...state,
-      ticker,
-      at: new Date().toISOString(),
-    });
-  } catch (e) {
-    pushLog('error', `刷新信号失败: ${e.message}`);
-    res.status(500).json({ error: e.message });
-  }
+app.post('/api/signal', (_req, res) => {
+  // 旧版单币 RSI 刷新接口已移除：信号由全市场扫描的 SuperTrend 引擎产生，请用 /api/signals 或 /api/scan/status
+  res.status(410).json({ ok: false, error: '单币 RSI 刷新接口已移除（SuperTrend 版本请使用 /api/signals）', moved_to: '/api/signals' });
 });
 
 app.get('/api/balance', async (req, res) => {
@@ -2546,8 +2698,7 @@ app.get('/api/balance', async (req, res) => {
 app.post('/api/trade/preview', async (req, res) => {
   const raw = req.body || {};
   const cfg = clampConfig(raw);
-  const profile = cfg.profile;
-  const action = raw.action || 'buy';
+  const direction = raw.direction === 'short' ? 'short' : 'long';
 
   if (raw.execute) {
     return res.status(403).json({
@@ -2557,52 +2708,39 @@ app.post('/api/trade/preview', async (req, res) => {
       liveAutoTradeDisabled: !liveTradingActive(),
     });
   }
-
   if (!raw.instId) return res.status(400).json({ error: 'instId 必填' });
   const instId = normalizeInstId(raw.instId, cfg.mode);
   let price = null;
-  let rsi = null;
   try {
-    const m = await fetchMarket({ ...cfg, instId });
-    price = m.price;
-    rsi = m.rsi;
+    price = (await fetchTickerHttp(instId))?.last ?? null;
   } catch (e) {
     return res.status(500).json({ error: `行情获取失败: ${e.message}` });
   }
-
-  const entry = price;
-  const tp = longTpPrice(entry, cfg.take_profit_pct);
-  const sl = longSlPrice(entry, cfg.stop_loss_pct);
+  if (!(price > 0)) return res.status(502).json({ error: '行情无有效价格' });
+  const block = shortBlockReason({ direction, execMode: cfg.exec_mode, tradeMode: cfg.mode, cfgAllowShort: cfg.allow_short });
+  const entry = simFillPrice(price, openSide(direction), cfg.sim_slippage_pct);
+  const sl = cfg.disaster_stop_pct > 0 ? stopLossPrice(entry, cfg.disaster_stop_pct, direction) : null;
   const preview = {
-    action,
     instId,
+    direction,
     mode: cfg.mode,
-    profile,
+    exec_mode: cfg.exec_mode,
     amount: cfg.amount,
-    rsi,
+    leverage: cfg.leverage,
     entry_price: entry,
-    take_profit_price: tp,
+    take_profit_price: null,
     stop_loss_price: sl,
+    blocked: block,
     simulated: true,
     liveAutoTradeDisabled: true,
     command:
       cfg.mode === 'swap'
-        ? `okx swap place --instId ${instId} --side buy --ordType market --sz ${cfg.amount} --tdMode cross --posSide long --lever ${cfg.leverage || 1} --tgtCcy quote_ccy --profile ${profile}`
-        : `okx spot place --instId ${instId} --side buy --ordType market --sz ${cfg.amount} --tgtCcy quote_ccy --profile ${profile}`,
+        ? `okx swap place --instId ${instId} --side ${openSide(direction)} --ordType market --tdMode cross --lever ${cfg.leverage || 1}（仅预览，不会执行）`
+        : `okx spot place --instId ${instId} --side buy --ordType market（仅预览，不会执行）`,
   };
-
   pushLog('info', `[预览] ${preview.command}`);
-  // 预览只在「本地模拟」下生成模拟持仓，绝不触发真实下单
-  if (action === 'buy' && entry != null && cfg.exec_mode === 'sim') {
-    tryOpenPosition({ instId, price: entry, rsi, signal: true }, cfg);
-  }
-  res.json({
-    ok: true,
-    executed: false,
-    reason: '预览（未实际发送订单）',
-    preview,
-    liveAutoTradeDisabled: !liveTradingActive(),
-  });
+  // 预览绝不开仓 / 下单（以前会在本地模拟下生成模拟持仓，现在只返回计算结果）
+  res.json({ ok: true, executed: false, reason: '预览（未实际发送订单，也不会生成模拟持仓）', preview, liveAutoTradeDisabled: !liveTradingActive() });
 });
 
 // ---------- OKX 账户（模拟盘 / 实盘）/ 急停 ----------
@@ -2659,9 +2797,11 @@ app.post('/api/live/check', async (req, res) => {
         max_positions: cfg.max_positions,
         daily_loss_limit_usdt: cfg.daily_loss_limit_usdt,
         max_orders_per_hour: cfg.max_orders_per_hour,
-        take_profit_pct: cfg.take_profit_pct,
-        stop_loss_pct: cfg.stop_loss_pct,
+        disaster_stop_pct: cfg.disaster_stop_pct,
+        allow_short: cfg.allow_short,
+        short_blocked: shortBlockReason({ direction: 'short', execMode: 'okx_live', tradeMode: cfg.mode, cfgAllowShort: cfg.allow_short }),
       },
+      shortConfirmText: SHORT_CONFIRM_TEXT,
       maxLeverage: LIVE_MAX_LEVERAGE,
       confirmText: LIVE_CONFIRM_TEXT,
     });
@@ -2710,10 +2850,7 @@ app.post('/api/kill', async (req, res) => {
         }
       } else {
         const price = Number(pos.last_price) || Number(pos.entry_price);
-        const pct = posProfitPct(pos.entry_price, price);
-        const trade = recordClose(pos, price, 'kill', pct);
-        positions.delete(pos.instId);
-        pushLog('sell', `[急停平仓·本地模拟] ${pos.instId} @ ${price} | ${pct.toFixed(2)}% | 约 ${trade.pnl_usdt.toFixed(2)} USDT`);
+        closeSimPosition(pos, price, 'kill', effectiveCfg());
         results.push({ instId: pos.instId, ok: true, exec_mode: 'sim' });
       }
     }
@@ -2758,7 +2895,7 @@ app.post('/api/monitor/start', async (req, res) => {
       round: 0,
       error: null,
     };
-    pushLog('info', `开始扫描（兼容 monitor/start） mode=${cfg.mode} · WebSocket`);
+    pushLog('info', `开始 SuperTrend 扫描（兼容 monitor/start） mode=${cfg.mode} · WebSocket`);
     setImmediate(() => {
       runBootstrapAndStart().catch((e) => pushLog('error', `启动异常: ${e.message}`));
     });
@@ -2768,6 +2905,7 @@ app.post('/api/monitor/start', async (req, res) => {
       } catch (e) {
         pushLog('error', `信号评估异常: ${e.message}`);
       }
+      refillStaleCandles().catch((e) => pushLog('warn', `K 线补齐异常: ${e.message}`));
     }, cfg.refreshSec * 1000);
     res.json({ ok: true, scan: publicScan(), monitor: { running: true }, feed: 'websocket' });
   } catch (e) {
@@ -2809,7 +2947,6 @@ process.on('unhandledRejection', (e) => {
 
 if (dataDirOverridden()) pushLog('info', `数据目录已通过环境变量重定向：${DATA_DIR}`);
 if (process.env.RSI_NO_ENV_LOCAL === '1') pushLog('info', 'RSI_NO_ENV_LOCAL=1：未读取 server/.env.local');
-if (ENGINE_SHADOW) pushLog('info', 'RSI_ENGINE_SHADOW=1：影子运行已开启（仅比对旧判断与新策略，不一致写 [回归] 警告，不影响下单）');
 loadState();
 loadCoinGuard();
 
@@ -2820,20 +2957,28 @@ export const __test = NO_LISTEN
       app,
       DATA_DIR,
       candleStore,
-      shadowStats,
       eventLog,
       positions,
+      pendingOrders,
+      handledFlips,
+      coinGuard,
       clampConfig,
-      recheckBuyCondition,
       evaluateSignals,
+      listTrades,
+      saveState,
       startScanForTest(cfgRaw) {
         scanState = { running: true, config: clampConfig(cfgRaw), startedAt: new Date().toISOString(), lastScanAt: null, round: 0, error: null };
+        applyStParams(scanState.config);
         return scanState.config;
       },
       setUniverseForTest(list) {
         lastUniverse = list;
       },
       getSignalsForTest: () => lastSignals,
+      setNow(fn) {
+        nowFn = typeof fn === 'function' ? fn : () => Date.now();
+      },
+      closeSimPositionForTest: (pos, price, action) => closeSimPosition(pos, price, action),
     }
   : null;
 
@@ -2842,7 +2987,7 @@ export const __test = NO_LISTEN
 if (NO_LISTEN) {
   pushLog('info', 'RSI_NO_LISTEN=1：未监听端口，未启动对账定时器（仅用于测试 / 演练）');
 } else app.listen(PORT, '127.0.0.1', () => {
-  pushLog('info', `RSI抄底宝扫描后端已启动 :${PORT} · 行情源 WebSocket`);
+  pushLog('info', `SuperTrend 翻转反手交易后端已启动 :${PORT} · 行情源 WebSocket`);
   const envNote = envLoad.loaded ? '（server/.env.local 中缺少必要项）' : '（未找到 server/.env.local）';
   pushLog('info', demoKeysConfigured() ? 'OKX 模拟盘 API Key：已配置（不显示内容）' : `OKX 模拟盘 API Key：未配置${envNote}`);
   pushLog(
@@ -2851,7 +2996,7 @@ if (NO_LISTEN) {
       ? 'OKX 实盘 API Key：已配置（不显示内容）· 仅在选择「OKX 实盘」、通过启动检查并输入「确认实盘」后才会下实盘单'
       : `OKX 实盘 API Key：未配置${envNote} · 实盘不可用`
   );
-  console.log(`[rsi-bottom-hunter] API http://127.0.0.1:${PORT}`);
+  console.log(`[supertrend-trader] API http://127.0.0.1:${PORT}`);
   const runReconcileAll = () => {
     for (const m of EXCHANGE_MODES) reconcileExchange(m).catch(() => {});
   };
