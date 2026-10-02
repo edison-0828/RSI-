@@ -1990,6 +1990,10 @@ app.post('/api/scan/start', async (req, res) => {
       error: null,
     };
 
+    pushLog(
+      'info',
+      `[冷却] 本次扫描止损冷却参数：普通止损 ${cfg.sl_cooldown_minutes} 分钟${cfg.sl_cooldown_minutes === 0 ? '（不冷却）' : ''} | 严重止损（亏损 ≥${cfg.severe_sl_pct}% 或强平）${cfg.severe_sl_cooldown_hours} 小时 | ${cfg.sl_filter_hours} 小时内止损 ${cfg.max_consecutive_sl} 次暂停（已在冷却中的币不改变到期时间）`
+    );
     const liveNote = isExchangeMode(cfg.exec_mode)
       ? ` | 执行：${execModeText(cfg.exec_mode)}真实下单 | 风控：日亏上限 ${cfg.daily_loss_limit_usdt}U · 每小时 ${cfg.max_orders_per_hour} 单 · 点差 ≤${cfg.max_spread_pct}%`
       : ' | 本地模拟（不下真实订单）';

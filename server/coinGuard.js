@@ -2,7 +2,7 @@
  * 同币冷却 / 止损过滤（本地模拟 · OKX 模拟盘 · OKX 实盘 通用，按执行模式分开计算）
  *
  * 规则：
- *  1) 普通止损：平仓后该币冷却 sl_cooldown_minutes 分钟（默认 60）
+ *  1) 普通止损：平仓后该币冷却 sl_cooldown_minutes 分钟（默认 60；0=不冷却；上限 10080 分钟=7 天；界面可直接输入）
  *  2) 严重止损：实际平仓价格变动亏损（不含杠杆）≥ severe_sl_pct%（默认 3%）→ 冷却 severe_sl_cooldown_hours 小时（默认 24）
  *     强平一律按严重止损处理
  *  3) 滚动窗口止损次数：sl_filter_hours 小时内止损累计 ≥ max_consecutive_sl 次 → 暂停 sl_filter_hours 小时
@@ -21,6 +21,9 @@ export const GUARD_DEFAULTS = Object.freeze({
   sl_filter_hours: 24,
 });
 
+/** 普通止损冷却分钟数上限（7 天） */
+export const SL_COOLDOWN_MAX_MINUTES = 10080;
+
 const KIND_TEXT = { normal: '普通止损', severe: '严重止损', streak: '连续止损' };
 const MODE_TEXT = { sim: '本地模拟', okx_demo: 'OKX 模拟盘', okx_live: 'OKX 实盘' };
 const LONG_MS = 365 * 24 * 3600 * 1000;
@@ -31,11 +34,18 @@ function num(v, def) {
   return Number.isFinite(n) ? n : def;
 }
 
-/** 冷却相关参数归一化（缺省用默认值；越界夹紧） */
+/** 普通止损冷却分钟数：非数字/负数回退默认 60；取整；0=不冷却；上限 10080 */
+export function clampSlCooldownMinutes(v) {
+  const n = num(v, GUARD_DEFAULTS.sl_cooldown_minutes);
+  if (n < 0) return GUARD_DEFAULTS.sl_cooldown_minutes;
+  return Math.min(SL_COOLDOWN_MAX_MINUTES, Math.round(n));
+}
+
+/** 冷却相关参数归一化（缺省/非法值用默认值；越界夹紧） */
 export function clampGuardCfg(cfg = {}) {
   const d = GUARD_DEFAULTS;
   return {
-    sl_cooldown_minutes: Math.max(0, Math.min(1440, num(cfg.sl_cooldown_minutes, d.sl_cooldown_minutes))),
+    sl_cooldown_minutes: clampSlCooldownMinutes(cfg.sl_cooldown_minutes),
     severe_sl_pct: Math.max(0.5, Math.min(50, num(cfg.severe_sl_pct, d.severe_sl_pct))),
     severe_sl_cooldown_hours: Math.max(0, Math.min(168, num(cfg.severe_sl_cooldown_hours, d.severe_sl_cooldown_hours))),
     max_consecutive_sl: Math.max(1, Math.min(20, Math.round(num(cfg.max_consecutive_sl, d.max_consecutive_sl)) || d.max_consecutive_sl)),

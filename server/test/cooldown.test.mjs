@@ -20,7 +20,7 @@ function mk(dir, t0 = Date.parse('2026-09-28T10:00:00+08:00')) {
 test('默认参数与夹紧', () => {
   assert.deepEqual(clampGuardCfg({}), { sl_cooldown_minutes: 60, severe_sl_pct: 3, severe_sl_cooldown_hours: 24, max_consecutive_sl: 2, sl_filter_hours: 24 });
   const c = clampGuardCfg({ sl_cooldown_minutes: 99999, severe_sl_pct: 0.1, severe_sl_cooldown_hours: -5, sl_filter_hours: 'abc' });
-  assert.equal(c.sl_cooldown_minutes, 1440);
+  assert.equal(c.sl_cooldown_minutes, 10080);
   assert.equal(c.severe_sl_pct, 0.5);
   assert.equal(c.severe_sl_cooldown_hours, 0);
   assert.equal(c.sl_filter_hours, 24);

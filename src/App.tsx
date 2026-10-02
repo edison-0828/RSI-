@@ -293,6 +293,32 @@ const LIVE_FORM_DEFAULTS: Partial<FormState> = {
 /** 按执行方式分开保存的字段 */
 const MODE_FIELDS: (keyof FormState)[] = ['amount', 'leverage', 'max_positions', 'daily_loss_limit_usdt', 'max_orders_per_hour'];
 const MODE_CFG_KEY = (m: ExecMode) => `rsi-bottom-hunter:mode-cfg:${m}`;
+/** 止损冷却 / 过滤参数（各执行方式共用）随改随存，刷新页面后保留 */
+const GUARD_FIELDS = ['sl_cooldown_minutes', 'severe_sl_pct', 'severe_sl_cooldown_hours', 'max_consecutive_sl', 'sl_filter_hours'] as const;
+const GUARD_CFG_KEY = 'rsi-bottom-hunter:guard-cfg';
+/** 普通止损冷却分钟数上限（与后端 SL_COOLDOWN_MAX_MINUTES 一致，7 天） */
+const SL_COOLDOWN_MAX_MINUTES = 10080;
+
+function loadGuardCfg(): Partial<FormState> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GUARD_CFG_KEY) || '{}') as Record<string, unknown>;
+    const o: Record<string, string> = {};
+    for (const k of GUARD_FIELDS) {
+      const v = raw[k];
+      if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) o[k] = v;
+    }
+    return o as Partial<FormState>;
+  } catch {
+    return {};
+  }
+}
+
+/** 数字输入框取值：空 / 非数字回退默认值（避免清空输入框被当成 0=不冷却） */
+function numOr(v: string | undefined, def: string): number {
+  const s = String(v ?? '').trim();
+  const n = s === '' ? NaN : Number(s);
+  return Number.isFinite(n) ? n : Number(def);
+}
 const LIVE_CONFIRM_TEXT = '确认实盘';
 
 function loadModeCfg(m: ExecMode): Partial<FormState> | null {
@@ -386,7 +412,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export default function App() {
-  const [form, setForm] = useState<FormState>(DEFAULTS);
+  const [form, setForm] = useState<FormState>(() => ({ ...DEFAULTS, ...loadGuardCfg() }));
   const [signals, setSignals] = useState<SignalRow[]>([]);
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [filtered, setFiltered] = useState<
@@ -443,6 +469,17 @@ export default function App() {
     saveModeCfg(form.exec_mode, form);
   }, [form]);
 
+  // 止损冷却参数随改随存
+  useEffect(() => {
+    try {
+      const o: Record<string, string> = {};
+      for (const k of GUARD_FIELDS) o[k] = String(form[k] ?? DEFAULTS[k]);
+      localStorage.setItem(GUARD_CFG_KEY, JSON.stringify(o));
+    } catch {
+      /* ignore */
+    }
+  }, [form.sl_cooldown_minutes, form.severe_sl_pct, form.severe_sl_cooldown_hours, form.max_consecutive_sl, form.sl_filter_hours]);
+
   const payload = useMemo(() => {
     const watchlist = form.watchlist
       .split(/[\s,，;；]+/)
@@ -465,9 +502,9 @@ export default function App() {
       scanConcurrency: Number(form.scanConcurrency),
       max_consecutive_sl: Number(form.max_consecutive_sl),
       sl_filter_hours: Number(form.sl_filter_hours),
-      sl_cooldown_minutes: Number(form.sl_cooldown_minutes ?? DEFAULTS.sl_cooldown_minutes),
-      severe_sl_pct: Number(form.severe_sl_pct ?? DEFAULTS.severe_sl_pct),
-      severe_sl_cooldown_hours: Number(form.severe_sl_cooldown_hours ?? DEFAULTS.severe_sl_cooldown_hours),
+      sl_cooldown_minutes: numOr(form.sl_cooldown_minutes, DEFAULTS.sl_cooldown_minutes),
+      severe_sl_pct: numOr(form.severe_sl_pct, DEFAULTS.severe_sl_pct),
+      severe_sl_cooldown_hours: numOr(form.severe_sl_cooldown_hours, DEFAULTS.severe_sl_cooldown_hours),
       leverage: Number(form.leverage),
       exec_mode: (form.mode === 'swap' ? form.exec_mode : 'sim') as ExecMode,
       confirm_on_close: form.confirm_on_close,
@@ -1232,15 +1269,16 @@ export default function App() {
               />
             </div>
             <div className="field">
-              <label>普通止损冷却(分钟)</label>
+              <label>普通止损冷却（分钟）</label>
               <input
                 type="number"
                 min="0"
-                max="1440"
+                max={SL_COOLDOWN_MAX_MINUTES}
+                step="1"
                 value={form.sl_cooldown_minutes ?? DEFAULTS.sl_cooldown_minutes}
                 onChange={(e) => setField('sl_cooldown_minutes', e.target.value)}
               />
-              <div className="hint">止损平仓后该币暂停开仓的分钟数，默认 60；0 = 不冷却</div>
+              <div className="hint">普通止损（亏损小于严重止损阈值）平仓后该币暂停开仓的分钟数，默认 60；0 = 不冷却；最大 10080（7 天）。修改后需重新开始扫描生效，已在冷却中的币不受影响</div>
             </div>
             <div className="field">
               <label>严重止损阈值(%)</label>
@@ -1255,7 +1293,7 @@ export default function App() {
               <div className="hint">实际平仓亏损（价格变动，不含杠杆）≥ 此值按严重止损处理，默认 3</div>
             </div>
             <div className="field">
-              <label>严重止损冷却(小时)</label>
+              <label>严重止损冷却（小时）</label>
               <input
                 type="number"
                 min="0"
@@ -1263,7 +1301,7 @@ export default function App() {
                 value={form.severe_sl_cooldown_hours ?? DEFAULTS.severe_sl_cooldown_hours}
                 onChange={(e) => setField('severe_sl_cooldown_hours', e.target.value)}
               />
-              <div className="hint">严重止损（或强平）后该币暂停开仓的小时数，默认 24</div>
+              <div className="hint">严重止损（亏损 ≥ 严重止损阈值）或强平后该币暂停开仓的小时数，默认 24；0 = 不冷却；最大 168。与上方「普通止损冷却」各自独立</div>
             </div>
             <div className="field">
               <label>窗口内止损次数后过滤</label>
